@@ -15,6 +15,11 @@ use windows::Win32::Graphics::GdiPlus::{
     GdipCreateBitmapFromFile, GdipCreateHICONFromBitmap, GdipDisposeImage,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
+    RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE,
+    REG_OPTION_NON_VOLATILE, REG_SZ,
+};
 
 use std::path::Path;
 
@@ -23,6 +28,9 @@ const IDM_RESTART: u32 = 1001;
 const IDM_CONFIG: u32 = 1002;
 const IDM_ABOUT: u32 = 1003;
 const IDM_EXIT: u32 = 1004;
+const IDM_STARTUP: u32 = 1005;
+const STARTUP_VALUE_NAME: windows::core::PCWSTR = w!("IME Indicator");
+const STARTUP_RUN_KEY: windows::core::PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 
 pub struct TrayManager {
     hwnd: HWND,
@@ -148,6 +156,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 IDM_ABOUT => {
                     show_about();
                 }
+                IDM_STARTUP => {
+                    let _ = set_startup_enabled(!is_startup_enabled());
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -162,6 +173,17 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
 
 unsafe fn show_context_menu(hwnd: HWND) {
     let menu = CreatePopupMenu().unwrap();
+    let startup_flag = if is_startup_enabled() {
+        windows::Win32::UI::WindowsAndMessaging::MF_CHECKED
+    } else {
+        windows::Win32::UI::WindowsAndMessaging::MF_UNCHECKED
+    };
+    let _ = windows::Win32::UI::WindowsAndMessaging::AppendMenuW(
+        menu,
+        windows::Win32::UI::WindowsAndMessaging::MF_STRING | startup_flag,
+        IDM_STARTUP as usize,
+        w!("开机自启 (Run at startup)"),
+    );
     let _ = windows::Win32::UI::WindowsAndMessaging::AppendMenuW(
         menu,
         windows::Win32::UI::WindowsAndMessaging::MF_STRING,
@@ -210,6 +232,64 @@ unsafe fn show_context_menu(hwnd: HWND) {
     ).unwrap();
     
     let _ = windows::Win32::UI::WindowsAndMessaging::DestroyMenu(menu);
+}
+
+/// Returns whether this user has enabled IME Indicator at Windows sign-in.
+fn is_startup_enabled() -> bool {
+    unsafe {
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            STARTUP_RUN_KEY,
+            0,
+            KEY_QUERY_VALUE,
+            &mut key,
+        )
+        .is_err()
+        {
+            return false;
+        }
+
+        let enabled = RegQueryValueExW(key, STARTUP_VALUE_NAME, None, None, None, None).is_ok();
+        let _ = RegCloseKey(key);
+        enabled
+    }
+}
+
+/// Stores the current executable path in the current user's Windows Run key,
+/// or removes it when startup is disabled.
+fn set_startup_enabled(enabled: bool) -> windows::core::Result<()> {
+    unsafe {
+        let mut key = HKEY::default();
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            STARTUP_RUN_KEY,
+            0,
+            None,
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut key,
+            None,
+        )
+        .ok()?;
+
+        let result = if enabled {
+            let exe_path = std::env::current_exe()?;
+            let command = format!("\"{}\"", exe_path.display());
+            let value: Vec<u16> = command.encode_utf16().chain(Some(0)).collect();
+            let bytes = std::slice::from_raw_parts(
+                value.as_ptr().cast::<u8>(),
+                value.len() * std::mem::size_of::<u16>(),
+            );
+            RegSetValueExW(key, STARTUP_VALUE_NAME, 0, REG_SZ, Some(bytes)).ok()
+        } else {
+            RegDeleteValueW(key, STARTUP_VALUE_NAME).ok()
+        };
+
+        let _ = RegCloseKey(key);
+        result
+    }
 }
 
 fn open_config() {
