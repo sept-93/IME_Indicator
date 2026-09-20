@@ -45,7 +45,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             poll_state_interval_ms: 30,
-            poll_track_interval_ms: 10,
+            poll_track_interval_ms: 16,
             tray_enable: true,
             auto_switch_enable: true,
             auto_switch_chinese_klid: "00000804".to_string(),
@@ -69,7 +69,7 @@ impl Default for Config {
             mouse_offset_x: 2,
             mouse_offset_y: 18,
             mouse_show_en: true,
-            mouse_target_cursors: vec![32513, 32512],
+            mouse_target_cursors: vec![32513],
         }
     }
 }
@@ -236,7 +236,7 @@ fn generate_toml_template() -> String {
     r##"# 输入指示器 (IME Indicator) 配置文件
 [poll]
 state_interval_ms = 30    # 状态检测间隔 (ms)；输入框通常在一次轮询内响应
-track_interval_ms = 10    # 位置追踪间隔 (ms)
+track_interval_ms = 16    # 位置追踪间隔 (ms)，约 60 FPS
 
 [tray]
 enable = true               # 是否显示托盘图标 (false 时完全后台运行，只能通过任务管理器结束)
@@ -270,7 +270,7 @@ size = 8                    # 提示球大小
 offset_x = 2
 offset_y = 18
 show_en = true              # 英文状态下是否显示
-target_cursors = [32513, 32512]  # I-Beam, Normal
+target_cursors = [32513]         # 仅 I-Beam；普通箭头会在非输入区造成误提示
 "##.to_string()
 }
 

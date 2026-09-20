@@ -144,6 +144,7 @@ fn run_detector_loop(running: Arc<AtomicBool>) {
             chinese_mode = is_chinese_mode();
             let caret_pos = caret_detector.get_caret_pos();
             let focus_context = caret_detector.focus_context(caret_pos.is_some());
+            let focus_editable = focus_context.editable;
             let readonly_document = focus_context.readonly_document;
             auto_switcher.observe(focus_context);
 
@@ -152,6 +153,7 @@ fn run_detector_loop(running: Arc<AtomicBool>) {
                 if let Some(ref overlay) = caret_overlay {
                     // 可见性线（黑名单制）：位置有、且焦点不在只读正文中才显示
                     let should_caret = caret_pos.is_some()
+                        && focus_editable
                         && !readonly_document
                         && (chinese_mode || config::caret_show_en());
                     if should_caret != caret_active {
@@ -169,7 +171,9 @@ fn run_detector_loop(running: Arc<AtomicBool>) {
             if config::mouse_enable() {
                 if let Some(ref overlay) = mouse_overlay {
                     let target_cursor = cursor_detector.is_target_cursor();
-                    let should_mouse = target_cursor && (chinese_mode || config::mouse_show_en());
+                    let should_mouse = focus_editable
+                        && target_cursor
+                        && (chinese_mode || config::mouse_show_en());
                     if should_mouse != mouse_active {
                         mouse_active = should_mouse;
                         if mouse_active {

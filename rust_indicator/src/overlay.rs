@@ -1,5 +1,6 @@
 //! GDI+ 悬浮窗渲染模块
 
+use std::cell::Cell;
 use std::ptr::null_mut;
 use windows::Win32::Foundation::{COLORREF, HMODULE, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -42,6 +43,7 @@ pub struct IndicatorOverlay {
     offset_x: i32,
     offset_y: i32,
     gdi_token: usize,
+    last_render: Cell<Option<(i32, i32, bool)>>,
 }
 
 impl IndicatorOverlay {
@@ -65,6 +67,7 @@ impl IndicatorOverlay {
             offset_x,
             offset_y,
             gdi_token,
+            last_render: Cell::new(None),
         }
     }
 
@@ -141,6 +144,13 @@ impl IndicatorOverlay {
 
     /// 更新渲染内容和屏幕位置
     pub fn update(&self, x: i32, y: i32, is_chinese: bool, caret_h: i32) {
+        let dest_x = x + self.offset_x - self.size / 2;
+        let dest_y = y + caret_h + self.offset_y - self.size / 2;
+        let render_state = (dest_x, dest_y, is_chinese);
+        if self.last_render.get() == Some(render_state) {
+            return;
+        }
+
         let color = if is_chinese {
             self.color_cn
         } else {
@@ -192,8 +202,8 @@ impl IndicatorOverlay {
 
             // UpdateLayeredWindow
             let dest_point = POINT {
-                x: x + self.offset_x - self.size / 2,
-                y: y + caret_h + self.offset_y - self.size / 2,
+                x: dest_x,
+                y: dest_y,
             };
             let src_point = POINT { x: 0, y: 0 };
             let size = SIZE {
@@ -234,6 +244,7 @@ impl IndicatorOverlay {
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
+            self.last_render.set(Some(render_state));
 
             // 处理消息
             let mut msg = MSG::default();

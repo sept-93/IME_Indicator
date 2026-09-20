@@ -184,7 +184,9 @@ impl CaretDetector {
                 // Word/contenteditable 会暴露非只读 ValuePattern。
                 value_is_readonly == Some(false)
             } else {
-                has_caret
+                // UIA 已明确返回按钮、窗格、列表等非编辑控件时，不再相信可能残留的
+                // Win32 Caret。UIA 查询失败以及兼容列表中的自绘应用仍走 Caret 回退。
+                false
             };
             let readonly_document = control_type == UIA_DocumentControlTypeId
                 && value_is_readonly != Some(false);
@@ -452,7 +454,8 @@ impl Default for CaretDetector {
 /// (NONCLIENTMETRICS.lfMessageFont,即 tkinter 默认字体对应的 Segoe UI)。
 fn font_height(hwnd: HWND) -> Option<i32> {
     use windows::Win32::Graphics::Gdi::{
-        CreateFontIndirectW, GetDC, GetTextMetricsW, ReleaseDC, SelectObject, HFONT, TEXTMETRICW,
+        CreateFontIndirectW, DeleteObject, GetDC, GetTextMetricsW, ReleaseDC, SelectObject, HFONT,
+        HGDIOBJ, TEXTMETRICW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         SendMessageW, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
@@ -461,7 +464,8 @@ fn font_height(hwnd: HWND) -> Option<i32> {
 
     unsafe {
         let font = SendMessageW(hwnd, WM_GETFONT, None, None);
-        let hfont: HFONT = if font.0 != 0 {
+        let owns_font = font.0 == 0;
+        let hfont: HFONT = if !owns_font {
             HFONT(font.0 as *mut _)
         } else {
             let mut ncm = NONCLIENTMETRICSW::default();
@@ -481,6 +485,11 @@ fn font_height(hwnd: HWND) -> Option<i32> {
         let ok = GetTextMetricsW(hdc, &mut tm).as_bool();
         SelectObject(hdc, old);
         ReleaseDC(hwnd, hdc);
+        // CreateFontIndirectW 返回的字体由调用方拥有。这里会在每次光标定位时
+        // 执行；若不释放，GDI 句柄耗尽后托盘菜单会出现空白甚至进程卡死。
+        if owns_font {
+            let _ = DeleteObject(HGDIOBJ(hfont.0));
+        }
         ok.then_some(tm.tmHeight)
     }
 }
