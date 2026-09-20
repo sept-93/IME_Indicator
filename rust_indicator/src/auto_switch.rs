@@ -77,11 +77,17 @@ impl AutoSwitcher {
         if changed {
             self.candidate = Some(context);
             self.candidate_since = Instant::now();
-            return;
+            // 输入框和搜索框优先响应：一旦检测到 Caret/Edit/Document 焦点，
+            // 本轮立即切换。非输入区仍保留短暂防抖，避免切窗口时闪动。
+            if !self.candidate.as_ref().is_some_and(|candidate| candidate.editable) {
+                return;
+            }
         }
 
         let settle = Duration::from_millis(crate::config::auto_switch_settle_ms());
-        if self.candidate_since.elapsed() < settle {
+        if self.candidate.as_ref().is_some_and(|candidate| !candidate.editable)
+            && self.candidate_since.elapsed() < settle
+        {
             return;
         }
 
@@ -201,6 +207,7 @@ mod tests {
             process_id: 1,
             editable,
             password,
+            readonly_document: false,
         }
     }
 

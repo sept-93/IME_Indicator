@@ -44,7 +44,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            poll_state_interval_ms: 100,
+            poll_state_interval_ms: 30,
             poll_track_interval_ms: 10,
             tray_enable: true,
             auto_switch_enable: true,
@@ -235,7 +235,7 @@ pub(crate) fn get_config_path() -> PathBuf {
 fn generate_toml_template() -> String {
     r##"# 输入指示器 (IME Indicator) 配置文件
 [poll]
-state_interval_ms = 100   # 状态检测间隔 (ms)
+state_interval_ms = 30    # 状态检测间隔 (ms)；输入框通常在一次轮询内响应
 track_interval_ms = 10    # 位置追踪间隔 (ms)
 
 [tray]

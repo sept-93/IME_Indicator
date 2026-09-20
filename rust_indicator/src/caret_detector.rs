@@ -48,6 +48,7 @@ pub struct FocusContext {
     pub process_id: u32,
     pub editable: bool,
     pub password: bool,
+    pub readonly_document: bool,
 }
 
 /// 检测来源
@@ -99,42 +100,6 @@ impl CaretDetector {
         }
     }
 
-    /// 可见性线（黑名单制）：只在确认焦点位于"不可输入的位置"时返回 true。
-    /// 目前已知唯一误显示来源是浏览器网页正文——焦点元素是只读 Document
-    /// （无 ValuePattern 或只读）；Word/contenteditable 是非只读 Document，正常显示。
-    /// 其余类型（Edit、按钮、终端……）与任何查询失败都按不隐藏处理，默认显示。
-    pub fn focus_is_readonly_document(&self) -> bool {
-        use windows::Win32::UI::Accessibility::{
-            IUIAutomationValuePattern, UIA_DocumentControlTypeId, UIA_ValuePatternId,
-        };
-        let mut process_id = 0u32;
-        unsafe {
-            GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut process_id));
-        }
-        if is_caret_fast_path_process(process_id) {
-            return false;
-        }
-
-        let Some(automation) = self.automation.as_ref() else {
-            return false;
-        };
-        let Ok(focused) = (unsafe { automation.GetFocusedElement() }) else {
-            return false;
-        };
-        let is_document = (unsafe { focused.CurrentControlType() })
-            .map_or(false, |t| t == UIA_DocumentControlTypeId);
-        if !is_document {
-            return false;
-        }
-        let value_pattern = unsafe { focused.GetCurrentPattern(UIA_ValuePatternId) }
-            .ok()
-            .and_then(|p| p.cast::<IUIAutomationValuePattern>().ok());
-        match value_pattern {
-            Some(vp) => matches!(unsafe { vp.CurrentIsReadOnly() }, Ok(ro) if ro.as_bool()),
-            None => true,
-        }
-    }
-
     /// 获取当前焦点元素的可编辑状态与稳定身份。UIA 查询失败时使用 Win32 焦点窗口
     /// 和是否存在真实文本光标作为保守回退。
     pub fn focus_context(&self, has_caret: bool) -> FocusContext {
@@ -175,6 +140,7 @@ impl CaretDetector {
                     process_id,
                     editable: has_caret,
                     password: false,
+                    readonly_document: false,
                 };
             }
 
@@ -186,6 +152,7 @@ impl CaretDetector {
                     process_id,
                     editable: has_caret,
                     password: false,
+                    readonly_document: false,
                 };
             };
             let Ok(focused) = automation.GetFocusedElement() else {
@@ -196,6 +163,7 @@ impl CaretDetector {
                     process_id,
                     editable: has_caret,
                     password: false,
+                    readonly_document: false,
                 };
             };
 
@@ -218,6 +186,8 @@ impl CaretDetector {
             } else {
                 has_caret
             };
+            let readonly_document = control_type == UIA_DocumentControlTypeId
+                && value_is_readonly != Some(false);
 
             let native_hwnd = focused.CurrentNativeWindowHandle().unwrap_or_default();
             let identity = if let Some(runtime_id) = uia_runtime_id(&focused) {
@@ -253,6 +223,7 @@ impl CaretDetector {
                 process_id,
                 editable,
                 password,
+                readonly_document,
             }
         }
     }
