@@ -3,9 +3,9 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
-    GetMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, TrackPopupMenu,
+    GetMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, TrackPopupMenu,
     TranslateMessage, CW_USEDEFAULT, HICON, MSG, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
-    WM_COMMAND, WM_DESTROY, WM_RBUTTONUP, WM_USER, WNDCLASSW,
+    WM_COMMAND, WM_DESTROY, WM_NULL, WM_RBUTTONUP, WM_USER, WNDCLASSW,
     WS_OVERLAPPEDWINDOW,
 };
 use windows::Win32::UI::Shell::{
@@ -18,10 +18,11 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
     RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE,
-    REG_OPTION_NON_VOLATILE, REG_SZ,
+    REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
 };
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const WM_TRAYICON: u32 = WM_USER + 1;
 const IDM_RESTART: u32 = 1001;
@@ -29,8 +30,23 @@ const IDM_CONFIG: u32 = 1002;
 const IDM_ABOUT: u32 = 1003;
 const IDM_EXIT: u32 = 1004;
 const IDM_STARTUP: u32 = 1005;
+const IDM_SMART_SWITCH: u32 = 1006;
 const STARTUP_VALUE_NAME: windows::core::PCWSTR = w!("IME Indicator");
 const STARTUP_RUN_KEY: windows::core::PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+const SETTINGS_KEY: windows::core::PCWSTR = w!("Software\\IME Indicator");
+const SMART_SWITCH_VALUE_NAME: windows::core::PCWSTR = w!("SmartSwitchEnabled");
+
+static SMART_SWITCH_ENABLED: AtomicBool = AtomicBool::new(true);
+static MENU_OPEN: AtomicBool = AtomicBool::new(false);
+
+pub fn initialize_smart_switch(default_enabled: bool) {
+    let enabled = read_smart_switch_enabled().unwrap_or(default_enabled);
+    SMART_SWITCH_ENABLED.store(enabled, Ordering::Release);
+}
+
+pub fn smart_switch_enabled() -> bool {
+    SMART_SWITCH_ENABLED.load(Ordering::Acquire)
+}
 
 pub struct TrayManager {
     hwnd: HWND,
@@ -124,7 +140,7 @@ impl TrayManager {
                 ..Default::default()
             };
             let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
-            DestroyWindow(self.hwnd).unwrap();
+            let _ = DestroyWindow(self.hwnd);
         }
     }
 }
@@ -141,7 +157,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             }
         }
         WM_COMMAND => {
-            let id = wparam.0 as u32;
+            let id = wparam.0 as u32 & 0xFFFF;
             match id {
                 IDM_EXIT => {
                     PostQuitMessage(0);
@@ -161,6 +177,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                         show_error(&format!("更新开机自启失败：\n{}", error));
                     }
                 }
+                IDM_SMART_SWITCH => {
+                    if let Err(error) = set_smart_switch_enabled(!smart_switch_enabled()) {
+                        show_error(&format!("更新智能切换失败：\n{}", error));
+                    }
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -174,8 +195,21 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
 }
 
 unsafe fn show_context_menu(hwnd: HWND) {
-    let menu = CreatePopupMenu().unwrap();
+    // TrackPopupMenu 会运行嵌套消息循环；重复右键可能重入 WndProc。只允许一个菜单实例，
+    // 并且所有 Win32 返回值都按可取消操作处理，避免用户点空白处时 unwrap 导致闪退。
+    if MENU_OPEN.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let Ok(menu) = CreatePopupMenu() else {
+        MENU_OPEN.store(false, Ordering::Release);
+        return;
+    };
     let startup_flag = if is_startup_enabled() {
+        windows::Win32::UI::WindowsAndMessaging::MF_CHECKED
+    } else {
+        windows::Win32::UI::WindowsAndMessaging::MF_UNCHECKED
+    };
+    let smart_switch_flag = if smart_switch_enabled() {
         windows::Win32::UI::WindowsAndMessaging::MF_CHECKED
     } else {
         windows::Win32::UI::WindowsAndMessaging::MF_UNCHECKED
@@ -185,6 +219,12 @@ unsafe fn show_context_menu(hwnd: HWND) {
         windows::Win32::UI::WindowsAndMessaging::MF_STRING,
         IDM_CONFIG as usize,
         w!("编辑配置 (Config)"),
+    );
+    let _ = windows::Win32::UI::WindowsAndMessaging::AppendMenuW(
+        menu,
+        windows::Win32::UI::WindowsAndMessaging::MF_STRING | smart_switch_flag,
+        IDM_SMART_SWITCH as usize,
+        w!("智能切换 (Smart)"),
     );
     let _ = windows::Win32::UI::WindowsAndMessaging::AppendMenuW(
         menu,
@@ -218,12 +258,16 @@ unsafe fn show_context_menu(hwnd: HWND) {
     );
 
     let mut pos = windows::Win32::Foundation::POINT::default();
-    GetCursorPos(&mut pos).unwrap();
+    if GetCursorPos(&mut pos).is_err() {
+        let _ = windows::Win32::UI::WindowsAndMessaging::DestroyMenu(menu);
+        MENU_OPEN.store(false, Ordering::Release);
+        return;
+    }
 
     // 必须设置前台窗口，否则菜单点击外部不会消失
     let _ = SetForegroundWindow(hwnd);
     
-    TrackPopupMenu(
+    let _ = TrackPopupMenu(
         menu,
         TPM_LEFTALIGN | TPM_BOTTOMALIGN,
         pos.x,
@@ -231,9 +275,76 @@ unsafe fn show_context_menu(hwnd: HWND) {
         0,
         hwnd,
         None,
-    ).unwrap();
-    
+    );
+
+    // Windows 文档建议菜单关闭后向所属窗口投递一条无操作消息，确保点击外部时
+    // 菜单状态完整退出，否则下一次右键可能重入或留下空白弹框。
+    let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
     let _ = windows::Win32::UI::WindowsAndMessaging::DestroyMenu(menu);
+    MENU_OPEN.store(false, Ordering::Release);
+}
+
+fn read_smart_switch_enabled() -> Option<bool> {
+    unsafe {
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            SETTINGS_KEY,
+            0,
+            KEY_QUERY_VALUE,
+            &mut key,
+        )
+        .is_err()
+        {
+            return None;
+        }
+        let mut value = 0u32;
+        let mut byte_len = std::mem::size_of::<u32>() as u32;
+        let result = RegQueryValueExW(
+            key,
+            SMART_SWITCH_VALUE_NAME,
+            None,
+            None,
+            Some((&mut value as *mut u32).cast::<u8>()),
+            Some(&mut byte_len),
+        );
+        let _ = RegCloseKey(key);
+        if result.is_err() {
+            return None;
+        }
+        Some(value != 0)
+    }
+}
+
+fn set_smart_switch_enabled(enabled: bool) -> windows::core::Result<()> {
+    unsafe {
+        let mut key = HKEY::default();
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            SETTINGS_KEY,
+            0,
+            None,
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut key,
+            None,
+        )
+        .ok()?;
+        let bytes = u32::from(enabled).to_ne_bytes();
+        let result = RegSetValueExW(
+            key,
+            SMART_SWITCH_VALUE_NAME,
+            0,
+            REG_DWORD,
+            Some(&bytes),
+        )
+        .ok();
+        let _ = RegCloseKey(key);
+        result?;
+        SMART_SWITCH_ENABLED.store(enabled, Ordering::Release);
+        Ok(())
+    }
 }
 
 fn is_startup_enabled() -> bool {

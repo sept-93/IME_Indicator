@@ -28,6 +28,7 @@ fn main() {
     
     // 配置高 DPI 感知
     set_dpi_awareness();
+    tray::initialize_smart_switch(config::auto_switch_enable());
 
     // 设置运行状态
     let running = Arc::new(AtomicBool::new(true));
@@ -146,6 +147,7 @@ fn run_detector_loop(running: Arc<AtomicBool>) {
             let focus_context = caret_detector.focus_context(caret_pos.is_some());
             let focus_editable = focus_context.editable;
             let readonly_document = focus_context.readonly_document;
+            let force_mouse_indicator = focus_context.force_mouse_indicator;
             auto_switcher.observe(focus_context);
 
             // Caret 状态判断
@@ -172,7 +174,7 @@ fn run_detector_loop(running: Arc<AtomicBool>) {
                 if let Some(ref overlay) = mouse_overlay {
                     let target_cursor = cursor_detector.is_target_cursor();
                     let should_mouse = focus_editable
-                        && target_cursor
+                        && (target_cursor || force_mouse_indicator)
                         && (chinese_mode || config::mouse_show_en());
                     if should_mouse != mouse_active {
                         mouse_active = should_mouse;

@@ -14,8 +14,10 @@
 - **智能切换**：首次进入可编辑区域时切到中文，离开时切到英语；当前输入框内允许手动切换。
 - **快速响应**：输入框、搜索框和 `contenteditable` 在识别到焦点的同一轮立即切换。
 - **富文本兼容**：针对 Chromium 网页编辑器与飞书等自绘输入区，使用受限的 Caret 回退识别。
+- **设计软件兼容**：支持 Photoshop、Illustrator、Cinema 4D 的输入框与重命名；Adobe 画布按 `T` 进入文字工具后切换中文，`Esc` 或 `Ctrl+Enter` 退出后切回英文。
 - **应用规则**：可按程序名设置自动、中文、英文或忽略规则。
 - **开机自启**：托盘菜单可为当前用户启用或关闭开机自启。
+- **随时停用**：托盘“智能切换 (Smart)”可即时暂停或恢复自动切换，并记住状态。
 
 ## 项目结构
 
@@ -60,8 +62,8 @@ extra_input_apps = ["CustomEditor.exe"]
 ```
 
 应用规则支持 `auto`、`chinese`、`english` 和 `ignore`。密码框始终按英文处理，
-除非应用规则明确指定其他模式。Chrome、Edge、Firefox、Tabbit Browser、飞书和
-Lark 已内置富文本兼容；其他应用如果有可见的文字光标但没有被识别，可把 EXE 文件名
+除非应用规则明确指定其他模式。Chrome、Edge、Firefox、Tabbit Browser、飞书、
+Lark、Photoshop、Illustrator 和 Cinema 4D 已内置兼容；其他应用如果有可见的文字光标但没有被识别，可把 EXE 文件名
 加入 `extra_input_apps`，保存配置后从托盘重启程序。该列表只补充输入区识别，不会把
 整个应用持续强制为中文；完全不提供文字光标的应用可改用 `app_rules` 固定语言。
 

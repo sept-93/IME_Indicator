@@ -53,6 +53,7 @@ pub struct AutoSwitcher {
     candidate: Option<FocusContext>,
     candidate_since: Instant,
     applied_context: Option<SwitchContextKey>,
+    enabled_last: bool,
 }
 
 impl AutoSwitcher {
@@ -61,12 +62,20 @@ impl AutoSwitcher {
             candidate: None,
             candidate_since: Instant::now(),
             applied_context: None,
+            enabled_last: crate::tray::smart_switch_enabled(),
         }
     }
 
     pub fn observe(&mut self, context: FocusContext) {
-        if !crate::config::auto_switch_enable() {
+        let enabled = crate::tray::smart_switch_enabled();
+        if !enabled {
+            self.enabled_last = false;
             return;
+        }
+        if !self.enabled_last {
+            self.candidate = None;
+            self.applied_context = None;
+            self.enabled_last = true;
         }
 
         let next_key = SwitchContextKey::from(&context);
@@ -208,6 +217,7 @@ mod tests {
             editable,
             password,
             readonly_document: false,
+            force_mouse_indicator: false,
         }
     }
 

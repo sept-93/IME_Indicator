@@ -1,6 +1,7 @@
 //! 文本光标位置检测模块 - 多级检测策略
 
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use windows::core::{Interface, PWSTR};
@@ -13,6 +14,9 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Accessibility::CUIAutomation;
 use windows::Win32::UI::Accessibility::IUIAutomation;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_RETURN,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
 };
@@ -41,7 +45,14 @@ const CARET_COMPAT_APPS: &[&str] = &[
     "Tabbit Browser.exe",
     "Feishu.exe",
     "Lark.exe",
+    "Photoshop.exe",
+    "Illustrator.exe",
+    "Cinema 4D.exe",
 ];
+
+/// Photoshop/Illustrator 的画布文字光标完全由应用绘制，Windows 没有 Caret 对象。
+/// 在这些应用内按 T 进入文字工具后进入兼容输入模式，Esc 或 Ctrl+Enter 退出。
+const DESIGN_TEXT_SHORTCUT_APPS: &[&str] = &["Photoshop.exe", "Illustrator.exe"];
 
 // ============================================================================
 // 类型定义
@@ -61,6 +72,7 @@ pub struct FocusContext {
     pub editable: bool,
     pub password: bool,
     pub readonly_document: bool,
+    pub force_mouse_indicator: bool,
 }
 
 /// 检测来源
@@ -91,6 +103,10 @@ pub struct CaretDetector {
     automation: Option<IUIAutomation>,
     pub last_source: DetectionSource,
     pub last_uia_error: String,
+    design_text_processes: HashSet<u32>,
+    t_down: bool,
+    escape_down: bool,
+    enter_down: bool,
 }
 
 impl CaretDetector {
@@ -109,12 +125,16 @@ impl CaretDetector {
             automation,
             last_source: DetectionSource::None,
             last_uia_error: String::new(),
+            design_text_processes: HashSet::new(),
+            t_down: false,
+            escape_down: false,
+            enter_down: false,
         }
     }
 
     /// 获取当前焦点元素的可编辑状态与稳定身份。UIA 查询失败时使用 Win32 焦点窗口
     /// 和是否存在真实文本光标作为保守回退。
-    pub fn focus_context(&self, has_caret: bool) -> FocusContext {
+    pub fn focus_context(&mut self, has_caret: bool) -> FocusContext {
         use windows::Win32::UI::Accessibility::{
             IUIAutomationValuePattern, UIA_DocumentControlTypeId, UIA_EditControlTypeId,
             UIA_ValuePatternId,
@@ -143,6 +163,11 @@ impl CaretDetector {
             );
 
             let process_name = process_name(process_id).unwrap_or_default();
+            let design_text_mode = self.update_design_text_mode(
+                &process_name,
+                process_id,
+                has_caret,
+            );
 
             // 微信等自绘应用的 UIA GetFocusedElement 会卡住约 3 秒，并且最终只返回
             // 顶层窗口。Win32/MSAA Caret 已能可靠反映聊天框和搜索框是否可输入。
@@ -155,6 +180,7 @@ impl CaretDetector {
                     editable: has_caret,
                     password: false,
                     readonly_document: false,
+                    force_mouse_indicator: false,
                 };
             }
 
@@ -164,9 +190,10 @@ impl CaretDetector {
                     foreground_hwnd,
                     focused_hwnd,
                     process_id,
-                    editable: has_caret,
+                    editable: has_caret || design_text_mode,
                     password: false,
                     readonly_document: false,
+                    force_mouse_indicator: design_text_mode && !has_caret,
                 };
             };
             let Ok(focused) = automation.GetFocusedElement() else {
@@ -175,9 +202,10 @@ impl CaretDetector {
                     foreground_hwnd,
                     focused_hwnd,
                     process_id,
-                    editable: has_caret,
+                    editable: has_caret || design_text_mode,
                     password: false,
                     readonly_document: false,
+                    force_mouse_indicator: design_text_mode && !has_caret,
                 };
             };
 
@@ -193,7 +221,7 @@ impl CaretDetector {
                 || crate::config::auto_switch_extra_input_apps()
                     .iter()
                     .any(|candidate| process_name.eq_ignore_ascii_case(candidate));
-            let editable = if password {
+            let standard_editable = if password {
                 true
             } else if control_type == UIA_EditControlTypeId {
                 value_is_readonly != Some(true)
@@ -208,6 +236,7 @@ impl CaretDetector {
                 // 使用 Caret 回退。其他应用保持严格模式，防止非输入区的黄色假点。
                 has_caret && caret_compat
             };
+            let editable = standard_editable || design_text_mode;
             let readonly_document = control_type == UIA_DocumentControlTypeId && !editable;
 
             let native_hwnd = focused.CurrentNativeWindowHandle().unwrap_or_default();
@@ -245,8 +274,40 @@ impl CaretDetector {
                 editable,
                 password,
                 readonly_document,
+                force_mouse_indicator: design_text_mode && !has_caret,
             }
         }
+    }
+
+    fn update_design_text_mode(
+        &mut self,
+        process_name: &str,
+        process_id: u32,
+        has_caret: bool,
+    ) -> bool {
+        let t_now = key_down(0x54); // T
+        let escape_now = key_down(VK_ESCAPE.0 as i32);
+        let enter_now = key_down(VK_RETURN.0 as i32);
+        let ctrl_now = key_down(VK_CONTROL.0 as i32);
+
+        let t_pressed = t_now && !self.t_down;
+        let escape_pressed = escape_now && !self.escape_down;
+        let enter_pressed = enter_now && !self.enter_down;
+        self.t_down = t_now;
+        self.escape_down = escape_now;
+        self.enter_down = enter_now;
+
+        if !process_matches(process_name, DESIGN_TEXT_SHORTCUT_APPS) || process_id == 0 {
+            return false;
+        }
+
+        if escape_pressed || (ctrl_now && enter_pressed) {
+            self.design_text_processes.remove(&process_id);
+        } else if t_pressed && !has_caret {
+            self.design_text_processes.insert(process_id);
+        }
+
+        self.design_text_processes.contains(&process_id)
     }
 
     /// 核心：按配置管线检测光标位置
@@ -378,6 +439,10 @@ fn process_matches(process_name: &str, candidates: &[&str]) -> bool {
         .any(|candidate| process_name.eq_ignore_ascii_case(candidate))
 }
 
+fn key_down(vkey: i32) -> bool {
+    unsafe { (GetAsyncKeyState(vkey) as u16 & 0x8000) != 0 }
+}
+
 fn process_name(process_id: u32) -> Option<String> {
     if process_id == 0 {
         return None;
@@ -404,7 +469,10 @@ fn process_name(process_id: u32) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{process_matches, CARET_COMPAT_APPS, CARET_FAST_PATH_APPS};
+    use super::{
+        process_matches, CARET_COMPAT_APPS, CARET_FAST_PATH_APPS,
+        DESIGN_TEXT_SHORTCUT_APPS,
+    };
 
     #[test]
     fn wechat_uses_caret_fast_path() {
@@ -416,8 +484,18 @@ mod tests {
         assert!(process_matches("chrome.exe", CARET_COMPAT_APPS));
         assert!(process_matches("Tabbit Browser.exe", CARET_COMPAT_APPS));
         assert!(process_matches("Feishu.exe", CARET_COMPAT_APPS));
+        assert!(process_matches("Photoshop.exe", CARET_COMPAT_APPS));
+        assert!(process_matches("Illustrator.exe", CARET_COMPAT_APPS));
+        assert!(process_matches("Cinema 4D.exe", CARET_COMPAT_APPS));
         assert!(!process_matches("eCloud.exe", CARET_COMPAT_APPS));
         assert!(!process_matches("FlClash.exe", CARET_COMPAT_APPS));
+    }
+
+    #[test]
+    fn adobe_canvas_apps_support_text_tool_shortcut() {
+        assert!(process_matches("Photoshop.exe", DESIGN_TEXT_SHORTCUT_APPS));
+        assert!(process_matches("Illustrator.exe", DESIGN_TEXT_SHORTCUT_APPS));
+        assert!(!process_matches("Cinema 4D.exe", DESIGN_TEXT_SHORTCUT_APPS));
     }
 }
 
