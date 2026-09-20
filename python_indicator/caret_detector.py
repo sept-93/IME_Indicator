@@ -1,8 +1,6 @@
 import ctypes
 from ctypes import byref, sizeof, wintypes, Structure, POINTER
-from win32_api import (
-    user32, oleacc, imm32, GUITHREADINFO, OBJID_CARET, COMPOSITIONFORM, CFS_POINT
-)
+from win32_api import user32, oleacc, GUITHREADINFO, OBJID_CARET
 import uiautomation as auto
 
 # 禁用 uiautomation 的一些冗长输出
@@ -27,6 +25,19 @@ class CaretDetector:
             0x81, 0x0C, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71
         )
 
+    def is_readonly_document_focus(self) -> bool:
+        """可见性线（黑名单制）：焦点是否位于只读 Document（浏览器网页正文等）。
+        只隐藏确认不可输入的场景，其余类型与查询失败一律不隐藏。"""
+        try:
+            focus = auto.GetFocusedControl()
+            if not focus: return False
+            if focus.ControlType != auto.ControlType.DocumentControl: return False
+            vp = focus.GetValuePattern()
+            if vp is None: return True
+            return bool(vp.IsReadOnly)
+        except Exception:
+            return False
+
     def get_caret_pos(self):
         """核心：多级检测光标位置"""
         try:
@@ -34,15 +45,7 @@ class CaretDetector:
             pos = self._get_pos_via_gui_info()
             if pos: return pos
 
-            # 第二级：UI Automation (支持 VS Code, Chrome)
-            pos = self._get_pos_via_uia()
-            if pos: return pos
-
-            # 第三级：IME 组合框
-            pos = self._get_pos_via_ime()
-            if pos: return pos
-
-            # 第四级：MSAA
+            # 第二级：MSAA OBJID_CARET (支持 VS Code/Edge)
             pos = self._get_pos_via_msaa()
             if pos: return pos
         except Exception:
@@ -60,39 +63,8 @@ class CaretDetector:
                 return pt.x, pt.y, h
         return None
 
-    def _get_pos_via_uia(self):
-        try:
-            focus = auto.GetFocusedControl()
-            if not focus: return None
-            pattern = focus.GetTextPattern()
-            if not pattern: return None
-            sel_ranges = pattern.GetSelection()
-            if not sel_ranges or len(sel_ranges) == 0: return None
-            range0 = sel_ranges[0]
-            rects = range0.GetBoundingRectangles()
-            if rects and len(rects) > 0:
-                r = rects[0]
-                return int(r.left), int(r.top), int(r.bottom - r.top)
-        except Exception: pass
-        return None
-
-    def _get_pos_via_ime(self):
-        hwnd = user32.GetForegroundWindow()
-        if not hwnd: return None
-        h_imc = imm32.ImmGetContext(hwnd)
-        if h_imc:
-            comp_form = COMPOSITIONFORM()
-            pos = None
-            if imm32.ImmGetCompositionWindow(h_imc, byref(comp_form)):
-                if comp_form.dwStyle & CFS_POINT:
-                    pt = wintypes.POINT(comp_form.ptCurrentPos.x, comp_form.ptCurrentPos.y)
-                    user32.ClientToScreen(hwnd, byref(pt))
-                    pos = (pt.x, pt.y, 20)
-            imm32.ImmReleaseContext(hwnd, h_imc)
-            return pos
-        return None
-
     def _get_pos_via_msaa(self):
+        """MSAA OBJID_CARET 光标对象（VS Code/Edge 支持）"""
         hwnd = user32.GetForegroundWindow()
         if not hwnd: return None
         p_acc = ctypes.c_void_p()
@@ -106,18 +78,9 @@ class CaretDetector:
                 if accLocation_func(p_acc, byref(x), byref(y), byref(w), byref(h), var_child) == 0:
                     release_func = ctypes.WINFUNCTYPE(wintypes.ULONG, ctypes.c_void_p)(vtable_ptr[2])
                     release_func(p_acc)
-                    if x.value != 0 or y.value != 0: return x.value, y.value, h.value
+                    # 有选区时 caret 对象矩形覆盖整个选区（光标在选区末尾），取右缘
+                    if x.value != 0 or y.value != 0: return x.value + w.value, y.value, h.value
                 release_func = ctypes.WINFUNCTYPE(wintypes.ULONG, ctypes.c_void_p)(vtable_ptr[2])
                 release_func(p_acc)
         except Exception: pass
-        
-        gui_info = GUITHREADINFO()
-        gui_info.cbSize = sizeof(GUITHREADINFO)
-        if user32.GetGUIThreadInfo(0, byref(gui_info)):
-            target_hwnd = gui_info.hwndCaret or gui_info.hwndFocus or gui_info.hwndActive
-            if target_hwnd and (gui_info.rcCaret.left != 0 or gui_info.rcCaret.top != 0):
-                pt = wintypes.POINT(gui_info.rcCaret.left, gui_info.rcCaret.top)
-                user32.ClientToScreen(target_hwnd, byref(pt))
-                if pt.x > -1000 and pt.y > -1000: 
-                    return pt.x, pt.y, (gui_info.rcCaret.bottom - gui_info.rcCaret.top)
         return None

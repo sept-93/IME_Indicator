@@ -157,7 +157,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                     show_about();
                 }
                 IDM_STARTUP => {
-                    let _ = set_startup_enabled(!is_startup_enabled());
+                    if let Err(error) = set_startup_enabled(!is_startup_enabled()) {
+                        show_error(&format!("更新开机自启失败：\n{}", error));
+                    }
                 }
                 _ => {}
             }
@@ -180,15 +182,15 @@ unsafe fn show_context_menu(hwnd: HWND) {
     };
     let _ = windows::Win32::UI::WindowsAndMessaging::AppendMenuW(
         menu,
-        windows::Win32::UI::WindowsAndMessaging::MF_STRING | startup_flag,
-        IDM_STARTUP as usize,
-        w!("开机自启 (Run at startup)"),
-    );
-    let _ = windows::Win32::UI::WindowsAndMessaging::AppendMenuW(
-        menu,
         windows::Win32::UI::WindowsAndMessaging::MF_STRING,
         IDM_CONFIG as usize,
         w!("编辑配置 (Config)"),
+    );
+    let _ = windows::Win32::UI::WindowsAndMessaging::AppendMenuW(
+        menu,
+        windows::Win32::UI::WindowsAndMessaging::MF_STRING | startup_flag,
+        IDM_STARTUP as usize,
+        w!("开机自启 (Run at startup)"),
     );
     let _ = windows::Win32::UI::WindowsAndMessaging::AppendMenuW(
         menu,
@@ -234,7 +236,6 @@ unsafe fn show_context_menu(hwnd: HWND) {
     let _ = windows::Win32::UI::WindowsAndMessaging::DestroyMenu(menu);
 }
 
-/// Returns whether this user has enabled IME Indicator at Windows sign-in.
 fn is_startup_enabled() -> bool {
     unsafe {
         let mut key = HKEY::default();
@@ -249,15 +250,12 @@ fn is_startup_enabled() -> bool {
         {
             return false;
         }
-
         let enabled = RegQueryValueExW(key, STARTUP_VALUE_NAME, None, None, None, None).is_ok();
         let _ = RegCloseKey(key);
         enabled
     }
 }
 
-/// Stores the current executable path in the current user's Windows Run key,
-/// or removes it when startup is disabled.
 fn set_startup_enabled(enabled: bool) -> windows::core::Result<()> {
     unsafe {
         let mut key = HKEY::default();
@@ -286,9 +284,16 @@ fn set_startup_enabled(enabled: bool) -> windows::core::Result<()> {
         } else {
             RegDeleteValueW(key, STARTUP_VALUE_NAME).ok()
         };
-
         let _ = RegCloseKey(key);
         result
+    }
+}
+
+fn show_error(message: &str) {
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+        let body: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
+        MessageBoxW(None, PCWSTR(body.as_ptr()), w!("输入指示器"), MB_ICONERROR | MB_OK);
     }
 }
 

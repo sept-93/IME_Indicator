@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod caret_detector;
+mod auto_switch;
 mod config;
 mod cursor_detector;
 mod ime_detector;
@@ -15,6 +16,7 @@ use windows::Win32::Foundation::POINT;
 use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, LoadIconW, IDI_APPLICATION};
 
 use caret_detector::CaretDetector;
+use auto_switch::AutoSwitcher;
 use cursor_detector::CursorDetector;
 use ime_detector::is_chinese_mode;
 use overlay::IndicatorOverlay;
@@ -95,6 +97,7 @@ fn main() {
 fn run_detector_loop(running: Arc<AtomicBool>) {
     // 初始化检测器
     let mut caret_detector = CaretDetector::new();
+    let mut auto_switcher = AutoSwitcher::new();
     let cursor_detector = CursorDetector::new(config::mouse_target_cursors());
 
     // 初始化悬浮窗
@@ -139,13 +142,17 @@ fn run_detector_loop(running: Arc<AtomicBool>) {
         // A. 状态检测 (100ms)
         if now.duration_since(last_state_check_time) >= state_interval {
             chinese_mode = is_chinese_mode();
+            let caret_pos = caret_detector.get_caret_pos();
+            let focus_context = caret_detector.focus_context(caret_pos.is_some());
+            auto_switcher.observe(focus_context);
 
             // Caret 状态判断
             if config::caret_enable() {
                 if let Some(ref overlay) = caret_overlay {
-                    let caret_pos = caret_detector.get_caret_pos();
-                    
-                    let should_caret = caret_pos.is_some() && (chinese_mode || config::caret_show_en());
+                    // 可见性线（黑名单制）：位置有、且焦点不在只读正文中才显示
+                    let should_caret = caret_pos.is_some()
+                        && !caret_detector.focus_is_readonly_document()
+                        && (chinese_mode || config::caret_show_en());
                     if should_caret != caret_active {
                         caret_active = should_caret;
                         if caret_active {
@@ -235,5 +242,4 @@ fn set_dpi_awareness() {
         }
     }
 }
-
 

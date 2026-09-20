@@ -1,21 +1,13 @@
 //! 文本光标位置检测模块 - 多级检测策略
 
 
-use windows::Win32::Foundation::POINT;
+use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED};
-use windows::Win32::System::Ole::{
-    SafeArrayAccessData, SafeArrayGetLBound, SafeArrayGetUBound, SafeArrayUnaccessData,
-};
-use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationTextPattern, IUIAutomationTextPattern2,
-    UIA_TextPattern2Id, UIA_TextPatternId,
-};
-use windows::Win32::UI::Input::Ime::{
-    CFS_POINT, COMPOSITIONFORM, ImmGetCompositionWindow, ImmGetContext, ImmReleaseContext,
-};
+use windows::Win32::UI::Accessibility::CUIAutomation;
+use windows::Win32::UI::Accessibility::IUIAutomation;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetGUIThreadInfo, GUITHREADINFO,
+    GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
 };
 use windows::core::Interface;
 
@@ -36,15 +28,35 @@ const IID_IACCESSIBLE: u128 = 0x618736e0_3c3d_11cf_810c_00aa00389b71;
 /// 光标位置信息 (x, y, height)
 pub type CaretPos = (i32, i32, i32);
 
+/// 自动切换所需的稳定焦点上下文。identity 只在应用或焦点元素变化时改变，
+/// 不随同一输入框内的光标移动而变化。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FocusContext {
+    pub identity: String,
+    pub foreground_hwnd: HWND,
+    pub focused_hwnd: HWND,
+    pub process_id: u32,
+    pub editable: bool,
+    pub password: bool,
+}
+
 /// 检测来源
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetectionSource {
     GuiInfo,
-    UiAutomation,
-    UiaCaretRange,
-    Ime,
-    MsaaFallback,
+    MsaaCaret,
     None,
+}
+
+impl DetectionSource {
+    /// 从配置名解析（配置里用 snake_case）
+    fn from_name(s: &str) -> Option<Self> {
+        match s {
+            "gui_info" => Some(DetectionSource::GuiInfo),
+            "msaa_caret" => Some(DetectionSource::MsaaCaret),
+            _ => None,
+        }
+    }
 }
 
 // ============================================================================
@@ -70,43 +82,167 @@ impl CaretDetector {
             CoCreateInstance(&CUIAutomation, None, CLSCTX_ALL).ok()
         };
 
-        Self { 
+        Self {
             automation,
             last_source: DetectionSource::None,
             last_uia_error: String::new(),
         }
     }
 
-    /// 核心：多级检测光标位置
+    /// 可见性线（黑名单制）：只在确认焦点位于"不可输入的位置"时返回 true。
+    /// 目前已知唯一误显示来源是浏览器网页正文——焦点元素是只读 Document
+    /// （无 ValuePattern 或只读）；Word/contenteditable 是非只读 Document，正常显示。
+    /// 其余类型（Edit、按钮、终端……）与任何查询失败都按不隐藏处理，默认显示。
+    pub fn focus_is_readonly_document(&self) -> bool {
+        use windows::Win32::UI::Accessibility::{
+            IUIAutomationValuePattern, UIA_DocumentControlTypeId, UIA_ValuePatternId,
+        };
+        let Some(automation) = self.automation.as_ref() else {
+            return false;
+        };
+        let Ok(focused) = (unsafe { automation.GetFocusedElement() }) else {
+            return false;
+        };
+        let is_document = (unsafe { focused.CurrentControlType() })
+            .map_or(false, |t| t == UIA_DocumentControlTypeId);
+        if !is_document {
+            return false;
+        }
+        let value_pattern = unsafe { focused.GetCurrentPattern(UIA_ValuePatternId) }
+            .ok()
+            .and_then(|p| p.cast::<IUIAutomationValuePattern>().ok());
+        match value_pattern {
+            Some(vp) => matches!(unsafe { vp.CurrentIsReadOnly() }, Ok(ro) if ro.as_bool()),
+            None => true,
+        }
+    }
+
+    /// 获取当前焦点元素的可编辑状态与稳定身份。UIA 查询失败时使用 Win32 焦点窗口
+    /// 和是否存在真实文本光标作为保守回退。
+    pub fn focus_context(&self, has_caret: bool) -> FocusContext {
+        use windows::Win32::UI::Accessibility::{
+            IUIAutomationValuePattern, UIA_DocumentControlTypeId, UIA_EditControlTypeId,
+            UIA_ValuePatternId,
+        };
+
+        unsafe {
+            let foreground_hwnd = GetForegroundWindow();
+            let mut process_id = 0u32;
+            let thread_id = GetWindowThreadProcessId(foreground_hwnd, Some(&mut process_id));
+            let mut gui_info = GUITHREADINFO {
+                cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+                ..Default::default()
+            };
+            let focused_hwnd = if GetGUIThreadInfo(thread_id, &mut gui_info).is_ok()
+                && !gui_info.hwndFocus.0.is_null()
+            {
+                gui_info.hwndFocus
+            } else {
+                foreground_hwnd
+            };
+
+            let fallback_identity = format!(
+                "{}:{}",
+                foreground_hwnd.0 as usize,
+                focused_hwnd.0 as usize
+            );
+            let Some(automation) = self.automation.as_ref() else {
+                return FocusContext {
+                    identity: fallback_identity,
+                    foreground_hwnd,
+                    focused_hwnd,
+                    process_id,
+                    editable: has_caret,
+                    password: false,
+                };
+            };
+            let Ok(focused) = automation.GetFocusedElement() else {
+                return FocusContext {
+                    identity: fallback_identity,
+                    foreground_hwnd,
+                    focused_hwnd,
+                    process_id,
+                    editable: has_caret,
+                    password: false,
+                };
+            };
+
+            let control_type = focused.CurrentControlType().unwrap_or_default();
+            let password = focused.CurrentIsPassword().map_or(false, |v| v.as_bool());
+            let value_pattern = focused.GetCurrentPattern(UIA_ValuePatternId)
+                .ok()
+                .and_then(|p| p.cast::<IUIAutomationValuePattern>().ok());
+            let value_is_readonly = value_pattern.as_ref()
+                .and_then(|vp| vp.CurrentIsReadOnly().ok())
+                .map(|v| v.as_bool());
+            let editable = if password {
+                true
+            } else if control_type == UIA_EditControlTypeId {
+                value_is_readonly != Some(true)
+            } else if control_type == UIA_DocumentControlTypeId {
+                // 浏览器正文有时会残留可定位的 caret，但只读 Document 仍不能输入。
+                // Word/contenteditable 会暴露非只读 ValuePattern。
+                value_is_readonly == Some(false)
+            } else {
+                has_caret
+            };
+
+            let native_hwnd = focused.CurrentNativeWindowHandle().unwrap_or_default();
+            let identity = if let Some(runtime_id) = uia_runtime_id(&focused) {
+                format!(
+                    "{}:{}:{}:{:?}",
+                    foreground_hwnd.0 as usize,
+                    native_hwnd.0 as usize,
+                    control_type.0,
+                    runtime_id,
+                )
+            } else {
+                let automation_id = focused.CurrentAutomationId()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                let bounds = focused.CurrentBoundingRectangle().unwrap_or_default();
+                format!(
+                    "{}:{}:{}:{}:{}:{}:{}:{}",
+                    foreground_hwnd.0 as usize,
+                    native_hwnd.0 as usize,
+                    control_type.0,
+                    automation_id,
+                    bounds.left,
+                    bounds.top,
+                    bounds.right,
+                    bounds.bottom,
+                )
+            };
+
+            FocusContext {
+                identity,
+                foreground_hwnd,
+                focused_hwnd,
+                process_id,
+                editable,
+                password,
+            }
+        }
+    }
+
+    /// 核心：按配置管线检测光标位置
     pub fn get_caret_pos(&mut self) -> Option<CaretPos> {
-        // 第一级：原生 Win32 (支持记事本)
-        if let Some(pos) = self.get_pos_via_gui_info() {
-            self.last_source = DetectionSource::GuiInfo;
-            return Some(pos);
-        }
+        self.detect()
+    }
 
-        // 第二级：UI Automation TextPattern2 GetCaretRange (支持 VS Code)
-        if let Some(pos) = self.get_pos_via_uia_caret_range() {
-            self.last_source = DetectionSource::UiaCaretRange;
-            return Some(pos);
-        }
-
-        // 第三级：UI Automation TextPattern GetSelection (支持 Chrome)
-        if let Some(pos) = self.get_pos_via_uia_selection() {
-            self.last_source = DetectionSource::UiAutomation;
-            return Some(pos);
-        }
-
-        // 第四级：IME 组合框
-        if let Some(pos) = self.get_pos_via_ime() {
-            self.last_source = DetectionSource::Ime;
-            return Some(pos);
-        }
-
-        // 第五级：MSAA 回退
-        if let Some(pos) = self.get_pos_via_msaa_fallback() {
-            self.last_source = DetectionSource::MsaaFallback;
-            return Some(pos);
+    /// 多级检测：按配置的 methods 顺序依次尝试
+    fn detect(&mut self) -> Option<CaretPos> {
+        for name in crate::config::caret_methods() {
+            let Some(method) = DetectionSource::from_name(name) else { continue };
+            let pos = match method {
+                DetectionSource::GuiInfo => self.get_pos_via_gui_info(),
+                DetectionSource::MsaaCaret => self.get_pos_via_msaa_caret(),
+                DetectionSource::None => None,
+            };
+            if let Some(pos) = pos {
+                self.last_source = method;
+                return Some(pos);
+            }
         }
 
         self.last_source = DetectionSource::None;
@@ -128,270 +264,25 @@ impl CaretDetector {
                         y: gui_info.rcCaret.top,
                     };
                     let _ = ClientToScreen(gui_info.hwndCaret, &mut pt);
-                    let h = gui_info.rcCaret.bottom - gui_info.rcCaret.top;
-                    return Some((pt.x, pt.y, h));
+                    // rcCaret 的高度是插入符位图高:有的程序(微信、Tk)只建 1x1 的
+                    // 标记插入符,rcCaret.top 只是插入点顶部。行高取位图高与焦点
+                    // 窗口字体行高中较大者(IME 候选框定位用的也是字体行高),
+                    // Notepad++ 等报真实行高的不受影响。
+                    let caret_h = gui_info.rcCaret.bottom - gui_info.rcCaret.top;
+                    let font_h = font_height(gui_info.hwndFocus).unwrap_or(caret_h);
+                    return Some((pt.x, pt.y, caret_h.max(font_h)));
                 }
             }
         }
         None
     }
 
-    /// 通过 UI Automation TextPattern2 GetCaretRange 获取光标位置 (支持 VS Code)
-    fn get_pos_via_uia_caret_range(&mut self) -> Option<CaretPos> {
-        use windows::Win32::UI::Accessibility::TextUnit_Character;
-        
-        let automation = self.automation.as_ref()?;
-        
-        // 清空错误信息（这是第一个 UIA 方法）
-        self.last_uia_error.clear();
-
-        unsafe {
-            // 获取焦点元素
-            let focused = match automation.GetFocusedElement() {
-                Ok(f) => f,
-                Err(e) => {
-                    self.last_uia_error = format!("Car:Focus:{:X}", e.code().0 as u32);
-                    return None;
-                }
-            };
-
-            // 尝试获取 TextPattern2 (更新版本，支持 GetCaretRange)
-            let pattern_obj = match focused.GetCurrentPattern(UIA_TextPattern2Id) {
-                Ok(p) => p,
-                Err(e) => {
-                    self.last_uia_error = format!("Car:Pat2:{:X}", e.code().0 as u32);
-                    return None;
-                }
-            };
-            
-            let text_pattern2: IUIAutomationTextPattern2 = match pattern_obj.cast() {
-                Ok(t) => t,
-                Err(e) => {
-                    self.last_uia_error = format!("Car:Cast:{:X}", e.code().0 as u32);
-                    return None;
-                }
-            };
-
-            // 获取光标范围
-            let mut is_active = windows::Win32::Foundation::BOOL::default();
-            let caret_range = match text_pattern2.GetCaretRange(&mut is_active) {
-                Ok(r) => r,
-                Err(e) => {
-                    self.last_uia_error = format!("Car:Range:{:X}", e.code().0 as u32);
-                    return None;
-                }
-            };
-
-            // 先尝试直接获取边界矩形
-            let rects = match caret_range.GetBoundingRectangles() {
-                Ok(r) => r,
-                Err(e) => {
-                    self.last_uia_error = format!("Car:Rect:{:X}", e.code().0 as u32);
-                    return None;
-                }
-            };
-
-            if rects.is_null() {
-                self.last_uia_error = "Car:Null".to_string();
-                return None;
-            }
-
-            // 使用 SafeArray API 访问数据
-            let lower = SafeArrayGetLBound(&*rects, 1).ok()?;
-            let upper = SafeArrayGetUBound(&*rects, 1).ok()?;
-            let elem_count = (upper - lower + 1) as usize;
-
-            // 如果为空，尝试扩展范围后再获取
-            if elem_count < 4 {
-                // 扩展到字符单元
-                if caret_range.ExpandToEnclosingUnit(TextUnit_Character).is_ok() {
-                    // 再次尝试获取边界矩形
-                    if let Ok(rects2) = caret_range.GetBoundingRectangles() {
-                        if !rects2.is_null() {
-                            let lower2 = SafeArrayGetLBound(&*rects2, 1).ok()?;
-                            let upper2 = SafeArrayGetUBound(&*rects2, 1).ok()?;
-                            let elem_count2 = (upper2 - lower2 + 1) as usize;
-                            
-                            if elem_count2 >= 4 {
-                                let mut data_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-                                if SafeArrayAccessData(&*rects2, &mut data_ptr).is_ok() {
-                                    let doubles = std::slice::from_raw_parts(data_ptr as *const f64, elem_count2);
-                                    let left = doubles[0] as i32;
-                                    let top = doubles[1] as i32;
-                                    let height = doubles[3] as i32;
-                                    let _ = SafeArrayUnaccessData(&*rects2);
-                                    return Some((left, top, height));
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                self.last_uia_error = format!("Car:Cnt:{}", elem_count);
-                return None;
-            }
-
-            // 访问数据
-            let mut data_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            if SafeArrayAccessData(&*rects, &mut data_ptr).is_err() {
-                self.last_uia_error = "Car:Access".to_string();
-                return None;
-            }
-
-            let doubles = std::slice::from_raw_parts(data_ptr as *const f64, elem_count);
-            let left = doubles[0] as i32;
-            let top = doubles[1] as i32;
-            let height = doubles[3] as i32;
-
-            let _ = SafeArrayUnaccessData(&*rects);
-
-            return Some((left, top, height));
-        }
-    }
-
-    /// 通过 UI Automation TextPattern GetSelection 获取光标位置 (支持 Chrome)
-    fn get_pos_via_uia_selection(&mut self) -> Option<CaretPos> {
-        let automation = self.automation.as_ref()?;
-        
-        // 追加错误信息的辅助闭包
-        let append_error = |s: &mut String, new: String| {
-            if !s.is_empty() {
-                s.push_str(" | ");
-            }
-            s.push_str(&new);
-        };
-
-        unsafe {
-            // 获取焦点元素
-            let focused = match automation.GetFocusedElement() {
-                Ok(f) => f,
-                Err(e) => {
-                    append_error(&mut self.last_uia_error, format!("Sel:Focus:{:X}", e.code().0 as u32));
-                    return None;
-                }
-            };
-
-            // 尝试获取 TextPattern
-            let pattern_obj = match focused.GetCurrentPattern(UIA_TextPatternId) {
-                Ok(p) => p,
-                Err(e) => {
-                    append_error(&mut self.last_uia_error, format!("Sel:Pat:{:X}", e.code().0 as u32));
-                    return None;
-                }
-            };
-            
-            let text_pattern: IUIAutomationTextPattern = match pattern_obj.cast() {
-                Ok(t) => t,
-                Err(e) => {
-                    append_error(&mut self.last_uia_error, format!("Sel:Cast:{:X}", e.code().0 as u32));
-                    return None;
-                }
-            };
-
-            // 获取选区
-            let selection = match text_pattern.GetSelection() {
-                Ok(s) => s,
-                Err(e) => {
-                    append_error(&mut self.last_uia_error, format!("Sel:Sel:{:X}", e.code().0 as u32));
-                    return None;
-                }
-            };
-            
-            let count = selection.Length().unwrap_or(0);
-            if count == 0 {
-                append_error(&mut self.last_uia_error, "Sel:NoSel".to_string());
-                return None;
-            }
-
-            // 获取第一个选区范围
-            let range = match selection.GetElement(0) {
-                Ok(r) => r,
-                Err(e) => {
-                    append_error(&mut self.last_uia_error, format!("Sel:Range:{:X}", e.code().0 as u32));
-                    return None;
-                }
-            };
-
-            // 获取边界矩形
-            let rects = match range.GetBoundingRectangles() {
-                Ok(r) => r,
-                Err(e) => {
-                    append_error(&mut self.last_uia_error, format!("Sel:Rect:{:X}", e.code().0 as u32));
-                    return None;
-                }
-            };
-
-            if rects.is_null() {
-                append_error(&mut self.last_uia_error, "Sel:Null".to_string());
-                return None;
-            }
-
-            // 使用 SafeArray API 访问数据
-            let lower = SafeArrayGetLBound(&*rects, 1).ok()?;
-            let upper = SafeArrayGetUBound(&*rects, 1).ok()?;
-            let elem_count = (upper - lower + 1) as usize;
-
-            if elem_count < 4 {
-                append_error(&mut self.last_uia_error, format!("Sel:Cnt:{}", elem_count));
-                return None;
-            }
-
-            // 访问数据
-            let mut data_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            if SafeArrayAccessData(&*rects, &mut data_ptr).is_err() {
-                append_error(&mut self.last_uia_error, "Sel:Access".to_string());
-                return None;
-            }
-
-            let doubles = std::slice::from_raw_parts(data_ptr as *const f64, elem_count);
-            let left = doubles[0] as i32;
-            let top = doubles[1] as i32;
-            let height = doubles[3] as i32;
-
-            let _ = SafeArrayUnaccessData(&*rects);
-
-            return Some((left, top, height));
-        }
-    }
-
-    /// 通过 IME 组合窗口获取光标位置
-    fn get_pos_via_ime(&self) -> Option<CaretPos> {
-        unsafe {
-            let hwnd = GetForegroundWindow();
-            if hwnd.0.is_null() {
-                return None;
-            }
-
-            let h_imc = ImmGetContext(hwnd);
-            if h_imc.0.is_null() {
-                return None;
-            }
-
-            let mut comp_form = COMPOSITIONFORM::default();
-            let mut pos = None;
-
-            if ImmGetCompositionWindow(h_imc, &mut comp_form).as_bool() {
-                if (comp_form.dwStyle & CFS_POINT) != 0 {
-                    let mut pt = POINT {
-                        x: comp_form.ptCurrentPos.x,
-                        y: comp_form.ptCurrentPos.y,
-                    };
-                    let _ = ClientToScreen(hwnd, &mut pt);
-                    pos = Some((pt.x, pt.y, 20));
-                }
-            }
-
-            let _ = ImmReleaseContext(hwnd, h_imc);
-            pos
-        }
-    }
-
-    /// MSAA：使用 AccessibleObjectFromWindow(OBJID_CARET) + IAccessible::accLocation
-    fn get_pos_via_msaa_fallback(&mut self) -> Option<CaretPos> {
+    /// 通过 MSAA OBJID_CARET 获取光标位置（VS Code 支持，浏览器不提供此对象）
+    fn get_pos_via_msaa_caret(&mut self) -> Option<CaretPos> {
         use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
         use windows::core::GUID;
         use windows::core::VARIANT;
-        
+
         // 追加错误信息
         let append_error = |s: &mut String, new: &str| {
             if !s.is_empty() {
@@ -399,7 +290,7 @@ impl CaretDetector {
             }
             s.push_str(new);
         };
-        
+
         unsafe {
             let hwnd = GetForegroundWindow();
             if hwnd.0.is_null() {
@@ -409,7 +300,7 @@ impl CaretDetector {
 
             // 使用模块级常量 IID_IACCESSIBLE
             let iid_iaccessible = GUID::from_u128(IID_IACCESSIBLE);
-            
+
             // 尝试获取 OBJID_CARET 的 IAccessible 接口
             let mut p_acc: Option<IAccessible> = None;
             let result = AccessibleObjectFromWindow(
@@ -418,74 +309,131 @@ impl CaretDetector {
                 &iid_iaccessible,
                 &mut p_acc as *mut _ as *mut *mut std::ffi::c_void,
             );
-            
+
             if result.is_err() {
                 append_error(&mut self.last_uia_error, &format!("MSAA:Err:{:X}", result.unwrap_err().code().0 as u32));
-                // 继续尝试 GUITHREADINFO 回退
+                return None;
             } else if p_acc.is_none() {
                 append_error(&mut self.last_uia_error, "MSAA:NoAcc");
-                // 继续尝试 GUITHREADINFO 回退
-            } else if let Some(acc) = p_acc {
-                // 调用 accLocation 获取位置
-                let mut x: i32 = 0;
-                let mut y: i32 = 0;
-                let mut w: i32 = 0;
-                let mut h: i32 = 0;
-                
-                // CHILDID_SELF = VARIANT with VT_I4 value 0
-                // 使用 from(0i32) 创建 VT_I4 类型的 VARIANT
-                let var_child = VARIANT::from(0i32);
-                
-                match acc.accLocation(&mut x, &mut y, &mut w, &mut h, &var_child) {
-                    Ok(_) => {
-                        if x != 0 || y != 0 {
-                            return Some((x, y, h));
-                        } else {
-                            append_error(&mut self.last_uia_error, "MSAA:Zero");
-                        }
-                    }
-                    Err(e) => {
-                        append_error(&mut self.last_uia_error, &format!("MSAA:Loc:{:X}", e.code().0 as u32));
-                    }
-                }
+                return None;
             }
 
-            // 回退到 GUITHREADINFO
-            let mut gui_info = GUITHREADINFO {
-                cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
-                ..Default::default()
-            };
+            let acc = p_acc.unwrap();
+            // 调用 accLocation 获取位置
+            let mut x: i32 = 0;
+            let mut y: i32 = 0;
+            let mut w: i32 = 0;
+            let mut h: i32 = 0;
 
-            if GetGUIThreadInfo(0, &mut gui_info).is_ok() {
-                let target_hwnd = if !gui_info.hwndCaret.0.is_null() {
-                    gui_info.hwndCaret
-                } else if !gui_info.hwndFocus.0.is_null() {
-                    gui_info.hwndFocus
-                } else if !gui_info.hwndActive.0.is_null() {
-                    gui_info.hwndActive
-                } else {
-                    return None;
-                };
+            // CHILDID_SELF = VARIANT with VT_I4 value 0
+            // 使用 from(0i32) 创建 VT_I4 类型的 VARIANT
+            let var_child = VARIANT::from(0i32);
 
-                if gui_info.rcCaret.left != 0 || gui_info.rcCaret.top != 0 {
-                    let mut pt = POINT {
-                        x: gui_info.rcCaret.left,
-                        y: gui_info.rcCaret.top,
-                    };
-                    let _ = ClientToScreen(target_hwnd, &mut pt);
-                    if pt.x > -1000 && pt.y > -1000 {
-                        let h = gui_info.rcCaret.bottom - gui_info.rcCaret.top;
-                        return Some((pt.x, pt.y, h));
+            match acc.accLocation(&mut x, &mut y, &mut w, &mut h, &var_child) {
+                Ok(_) => {
+                    if x != 0 || y != 0 {
+                        // 有选区时 caret 对象矩形覆盖整个选区（光标在选区末尾），取右缘
+                        return Some((x + w, y, h));
+                    } else {
+                        append_error(&mut self.last_uia_error, "MSAA:Zero");
+                        None
                     }
+                }
+                Err(e) => {
+                    append_error(&mut self.last_uia_error, &format!("MSAA:Loc:{:X}", e.code().0 as u32));
+                    None
                 }
             }
         }
-        None
+    }
+}
+
+/// UIA RuntimeId 是元素在当前桌面会话内的稳定身份；相比控件坐标，它不会因
+/// 同一编辑器滚动或窗口移动而变化。
+fn uia_runtime_id(element: &windows::Win32::UI::Accessibility::IUIAutomationElement) -> Option<Vec<i32>> {
+    use windows::Win32::System::Ole::{
+        SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetLBound, SafeArrayGetUBound,
+        SafeArrayUnaccessData,
+    };
+
+    unsafe {
+        let array = element.GetRuntimeId().ok()?;
+        if array.is_null() {
+            return None;
+        }
+        let lower = match SafeArrayGetLBound(array, 1) {
+            Ok(value) => value,
+            Err(_) => {
+                let _ = SafeArrayDestroy(array);
+                return None;
+            }
+        };
+        let upper = match SafeArrayGetUBound(array, 1) {
+            Ok(value) => value,
+            Err(_) => {
+                let _ = SafeArrayDestroy(array);
+                return None;
+            }
+        };
+        if upper < lower {
+            let _ = SafeArrayDestroy(array);
+            return None;
+        }
+        let mut data = std::ptr::null_mut();
+        if SafeArrayAccessData(array, &mut data).is_err() {
+            let _ = SafeArrayDestroy(array);
+            return None;
+        }
+        let values = std::slice::from_raw_parts(
+            data.cast::<i32>(),
+            (upper - lower + 1) as usize,
+        )
+        .to_vec();
+        let _ = SafeArrayUnaccessData(array);
+        let _ = SafeArrayDestroy(array);
+        Some(values)
     }
 }
 
 impl Default for CaretDetector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// 窗口字体的行高(tmHeight)。窗口未设置字体(自绘框架)时用系统 UI 字体
+/// (NONCLIENTMETRICS.lfMessageFont,即 tkinter 默认字体对应的 Segoe UI)。
+fn font_height(hwnd: HWND) -> Option<i32> {
+    use windows::Win32::Graphics::Gdi::{
+        CreateFontIndirectW, GetDC, GetTextMetricsW, ReleaseDC, SelectObject, HFONT, TEXTMETRICW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SendMessageW, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+        SystemParametersInfoW, WM_GETFONT,
+    };
+
+    unsafe {
+        let font = SendMessageW(hwnd, WM_GETFONT, None, None);
+        let hfont: HFONT = if font.0 != 0 {
+            HFONT(font.0 as *mut _)
+        } else {
+            let mut ncm = NONCLIENTMETRICSW::default();
+            ncm.cbSize = std::mem::size_of::<NONCLIENTMETRICSW>() as u32;
+            SystemParametersInfoW(
+                SPI_GETNONCLIENTMETRICS,
+                ncm.cbSize,
+                Some(&mut ncm as *mut _ as *mut _),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+            .ok()?;
+            HFONT(CreateFontIndirectW(&ncm.lfMessageFont).0)
+        };
+        let hdc = GetDC(hwnd);
+        let old = SelectObject(hdc, hfont);
+        let mut tm = TEXTMETRICW::default();
+        let ok = GetTextMetricsW(hdc, &mut tm).as_bool();
+        SelectObject(hdc, old);
+        ReleaseDC(hwnd, hdc);
+        ok.then_some(tm.tmHeight)
     }
 }

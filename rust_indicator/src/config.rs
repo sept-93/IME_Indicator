@@ -16,6 +16,12 @@ pub struct Config {
 
     pub tray_enable: bool,
 
+    pub auto_switch_enable: bool,
+    pub auto_switch_chinese_klid: String,
+    pub auto_switch_english_klid: String,
+    pub auto_switch_settle_ms: u64,
+    pub auto_switch_app_rules: HashMap<String, String>,
+
     pub caret_enable: bool,
     pub caret_color_cn: u32,
     pub caret_color_en: u32,
@@ -23,6 +29,7 @@ pub struct Config {
     pub caret_offset_x: i32,
     pub caret_offset_y: i32,
     pub caret_show_en: bool,
+    pub caret_methods: Vec<String>,
 
     pub mouse_enable: bool,
     pub mouse_color_cn: u32,
@@ -40,6 +47,11 @@ impl Default for Config {
             poll_state_interval_ms: 100,
             poll_track_interval_ms: 10,
             tray_enable: true,
+            auto_switch_enable: true,
+            auto_switch_chinese_klid: "00000804".to_string(),
+            auto_switch_english_klid: "00000409".to_string(),
+            auto_switch_settle_ms: 150,
+            auto_switch_app_rules: HashMap::new(),
             caret_enable: true,
             caret_color_cn: parse_color("#FF7800A0"),
             caret_color_en: parse_color("#0078FF30"),
@@ -47,6 +59,9 @@ impl Default for Config {
             caret_offset_x: 0,
             caret_offset_y: 0,
             caret_show_en: true,
+            // 实测（2026-09）：gui_info 覆盖记事本，msaa_caret 覆盖 VS Code/Edge
+            caret_methods: ["gui_info", "msaa_caret"]
+                .iter().map(|s| s.to_string()).collect(),
             mouse_enable: true,
             mouse_color_cn: parse_color("#FF7800A0"),
             mouse_color_en: parse_color("#0078FF30"),
@@ -128,6 +143,37 @@ fn load_config() -> Config {
                 _ => {} // 保持默认值
             }
         }
+
+        if let Some(v) = get("auto_switch", "enable") {
+            match v.as_str() {
+                "true" => config.auto_switch_enable = true,
+                "false" => config.auto_switch_enable = false,
+                _ => {}
+            }
+        }
+        if let Some(v) = get("auto_switch", "chinese_klid") {
+            config.auto_switch_chinese_klid = v.trim_matches('"').to_string();
+        }
+        if let Some(v) = get("auto_switch", "english_klid") {
+            config.auto_switch_english_klid = v.trim_matches('"').to_string();
+        }
+        if let Some(v) = get("auto_switch", "settle_ms") {
+            if let Ok(n) = v.parse() { config.auto_switch_settle_ms = n; }
+        }
+        if let Some(v) = get("auto_switch", "app_rules") {
+            for item in v.trim_matches(|c| c == '[' || c == ']')
+                .split(',')
+                .map(|s| s.trim().trim_matches('"'))
+                .filter(|s| !s.is_empty())
+            {
+                if let Some((app, rule)) = item.split_once('=') {
+                    let rule = rule.trim().to_lowercase();
+                    if matches!(rule.as_str(), "auto" | "chinese" | "english" | "ignore") {
+                        config.auto_switch_app_rules.insert(app.trim().to_lowercase(), rule);
+                    }
+                }
+            }
+        }
         
         if let Some(v) = get("caret", "enable") { 
             match v.as_str() {
@@ -141,12 +187,18 @@ fn load_config() -> Config {
         if let Some(v) = get("caret", "size")     { if let Ok(n) = v.parse() { config.caret_size = n; } }
         if let Some(v) = get("caret", "offset_x") { if let Ok(n) = v.parse() { config.caret_offset_x = n; } }
         if let Some(v) = get("caret", "offset_y") { if let Ok(n) = v.parse() { config.caret_offset_y = n; } }
-        if let Some(v) = get("caret", "show_en") { 
+        if let Some(v) = get("caret", "show_en") {
             match v.as_str() {
                 "true" => config.caret_show_en = true,
                 "false" => config.caret_show_en = false,
                 _ => {}
             }
+        }
+        if let Some(v) = get("caret", "methods") {
+            let list: Vec<String> = v.trim_matches(|c| c == '[' || c == ']')
+                .split(',').map(|s| s.trim().trim_matches('"').to_lowercase())
+                .filter(|s| !s.is_empty()).collect();
+            if !list.is_empty() { config.caret_methods = list; }
         }
 
         if let Some(v) = get("mouse", "enable") { 
@@ -189,6 +241,15 @@ track_interval_ms = 10    # 位置追踪间隔 (ms)
 [tray]
 enable = true               # 是否显示托盘图标 (false 时完全后台运行，只能通过任务管理器结束)
 
+[auto_switch]
+enable = true               # 是否按焦点上下文自动切换输入法
+chinese_klid = "00000804"  # 当前系统启用的简体中文输入法
+english_klid = "00000409"  # 英语（美国）键盘
+settle_ms = 150             # 焦点稳定多久后切换，避免快速切换时抖动
+# 按进程名覆盖默认行为，可选 auto/chinese/english/ignore；规则只在上下文变化时执行一次
+# app_rules = ["WindowsTerminal.exe=english", "Obsidian.exe=chinese", "game.exe=ignore"]
+app_rules = []
+
 [caret]
 enable = true               # 是否启用文本光标提示
 color_cn = "#FF7800A0"    # 中文状态颜色 (#RRGGBBAA)
@@ -197,6 +258,9 @@ size = 8                    # 提示球大小
 offset_x = 0
 offset_y = 0
 show_en = true              # 英文状态下是否显示
+# 光标检测方法及落级顺序（可删减、可调序）
+# 可选: gui_info(记事本等原生) msaa_caret(caret 对象, VS Code/Edge)
+methods = ["gui_info", "msaa_caret"]
 
 [mouse]
 enable = true               # 是否开启鼠标提示
@@ -220,6 +284,13 @@ pub fn get() -> &'static Config { CONFIG.get_or_init(load_config) }
 pub fn state_poll_interval_ms() -> u64 { get().poll_state_interval_ms }
 pub fn track_poll_interval_ms() -> u64 { get().poll_track_interval_ms }
 pub fn tray_enable() -> bool { get().tray_enable }
+pub fn auto_switch_enable() -> bool { get().auto_switch_enable }
+pub fn auto_switch_chinese_klid() -> &'static str { &get().auto_switch_chinese_klid }
+pub fn auto_switch_english_klid() -> &'static str { &get().auto_switch_english_klid }
+pub fn auto_switch_settle_ms() -> u64 { get().auto_switch_settle_ms }
+pub fn auto_switch_app_rule(process_name: &str) -> Option<&'static str> {
+    get().auto_switch_app_rules.get(&process_name.to_lowercase()).map(String::as_str)
+}
 pub fn caret_enable() -> bool { get().caret_enable }
 pub fn caret_color_cn() -> u32 { get().caret_color_cn }
 pub fn caret_color_en() -> u32 { get().caret_color_en }
@@ -227,6 +298,7 @@ pub fn caret_size() -> i32 { get().caret_size }
 pub fn caret_offset_x() -> i32 { get().caret_offset_x }
 pub fn caret_offset_y() -> i32 { get().caret_offset_y }
 pub fn caret_show_en() -> bool { get().caret_show_en }
+pub fn caret_methods() -> &'static [String] { &get().caret_methods }
 pub fn mouse_enable() -> bool { get().mouse_enable }
 pub fn mouse_color_cn() -> u32 { get().mouse_color_cn }
 pub fn mouse_color_en() -> u32 { get().mouse_color_en }
