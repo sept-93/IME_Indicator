@@ -190,7 +190,7 @@ unsafe fn show_context_menu(hwnd: HWND) {
         menu,
         windows::Win32::UI::WindowsAndMessaging::MF_STRING | startup_flag,
         IDM_STARTUP as usize,
-        w!("开机自启"),
+        w!("开机自启 (Startup)"),
     );
     let _ = windows::Win32::UI::WindowsAndMessaging::AppendMenuW(
         menu,
