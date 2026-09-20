@@ -30,10 +30,29 @@ enum LanguageTarget {
     English,
 }
 
+/// UIA 元素身份之外还要记录输入语义。微信等自绘应用始终只暴露同一个
+/// 顶层窗口，但进入/离开输入区时系统 Caret 状态仍会改变。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SwitchContextKey {
+    identity: String,
+    editable: bool,
+    password: bool,
+}
+
+impl From<&FocusContext> for SwitchContextKey {
+    fn from(context: &FocusContext) -> Self {
+        Self {
+            identity: context.identity.clone(),
+            editable: context.editable,
+            password: context.password,
+        }
+    }
+}
+
 pub struct AutoSwitcher {
     candidate: Option<FocusContext>,
     candidate_since: Instant,
-    applied_identity: Option<String>,
+    applied_context: Option<SwitchContextKey>,
 }
 
 impl AutoSwitcher {
@@ -41,7 +60,7 @@ impl AutoSwitcher {
         Self {
             candidate: None,
             candidate_since: Instant::now(),
-            applied_identity: None,
+            applied_context: None,
         }
     }
 
@@ -50,8 +69,11 @@ impl AutoSwitcher {
             return;
         }
 
-        let changed = self.candidate.as_ref()
-            .map_or(true, |current| current.identity != context.identity);
+        let next_key = SwitchContextKey::from(&context);
+        let changed = self
+            .candidate
+            .as_ref()
+            .map_or(true, |current| SwitchContextKey::from(current) != next_key);
         if changed {
             self.candidate = Some(context);
             self.candidate_since = Instant::now();
@@ -63,13 +85,16 @@ impl AutoSwitcher {
             return;
         }
 
-        let Some(context) = self.candidate.as_ref() else { return };
-        if self.applied_identity.as_deref() == Some(context.identity.as_str()) {
+        let Some(context) = self.candidate.as_ref() else {
+            return;
+        };
+        let context_key = SwitchContextKey::from(context);
+        if self.applied_context.as_ref() == Some(&context_key) {
             return;
         }
 
         // 无论切换成功与否，本上下文都只尝试一次，避免不兼容窗口被循环轰炸。
-        self.applied_identity = Some(context.identity.clone());
+        self.applied_context = Some(context_key);
 
         let process_name = process_name(context.process_id).unwrap_or_default();
         let rule = crate::config::auto_switch_app_rule(&process_name).unwrap_or("auto");
@@ -163,7 +188,21 @@ fn send_ime_control(hwnd: HWND, command: usize, value: isize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{target_for, LanguageTarget};
+    use windows::Win32::Foundation::HWND;
+
+    use super::{target_for, LanguageTarget, SwitchContextKey};
+    use crate::caret_detector::FocusContext;
+
+    fn context(editable: bool, password: bool) -> FocusContext {
+        FocusContext {
+            identity: "same-wechat-window".to_string(),
+            foreground_hwnd: HWND::default(),
+            focused_hwnd: HWND::default(),
+            process_id: 1,
+            editable,
+            password,
+        }
+    }
 
     #[test]
     fn automatic_rules_follow_context() {
@@ -177,5 +216,20 @@ mod tests {
         assert_eq!(target_for("chinese", true, false), Some(LanguageTarget::Chinese));
         assert_eq!(target_for("english", false, true), Some(LanguageTarget::English));
         assert_eq!(target_for("ignore", false, true), None);
+    }
+
+    #[test]
+    fn editable_state_changes_context_for_custom_drawn_apps() {
+        let non_input = context(false, false);
+        let input = context(true, false);
+
+        assert_ne!(
+            SwitchContextKey::from(&non_input),
+            SwitchContextKey::from(&input)
+        );
+        assert_eq!(
+            SwitchContextKey::from(&input),
+            SwitchContextKey::from(&input)
+        );
     }
 }
