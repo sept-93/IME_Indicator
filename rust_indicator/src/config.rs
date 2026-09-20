@@ -21,6 +21,7 @@ pub struct Config {
     pub auto_switch_english_klid: String,
     pub auto_switch_settle_ms: u64,
     pub auto_switch_app_rules: HashMap<String, String>,
+    pub auto_switch_extra_input_apps: Vec<String>,
 
     pub caret_enable: bool,
     pub caret_color_cn: u32,
@@ -52,6 +53,7 @@ impl Default for Config {
             auto_switch_english_klid: "00000409".to_string(),
             auto_switch_settle_ms: 80,
             auto_switch_app_rules: HashMap::new(),
+            auto_switch_extra_input_apps: Vec::new(),
             caret_enable: true,
             caret_color_cn: parse_color("#FF7800A0"),
             caret_color_en: parse_color("#0078FF30"),
@@ -174,6 +176,13 @@ fn load_config() -> Config {
                 }
             }
         }
+        if let Some(v) = get("auto_switch", "extra_input_apps") {
+            config.auto_switch_extra_input_apps = v.trim_matches(|c| c == '[' || c == ']')
+                .split(',')
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
         
         if let Some(v) = get("caret", "enable") { 
             match v.as_str() {
@@ -249,6 +258,9 @@ settle_ms = 80              # 焦点稳定多久后切换；低于一次状态�
 # 按进程名覆盖默认行为，可选 auto/chinese/english/ignore；规则只在上下文变化时执行一次
 # app_rules = ["WindowsTerminal.exe=english", "Obsidian.exe=chinese", "game.exe=ignore"]
 app_rules = []
+# 自定义补充：应用有真实文字光标、但输入区无法自动识别时，在此填写 EXE 文件名；修改后重启
+# extra_input_apps = ["Obsidian.exe", "CustomEditor.exe"]
+extra_input_apps = []
 
 [caret]
 enable = true               # 是否启用文本光标提示
@@ -290,6 +302,9 @@ pub fn auto_switch_english_klid() -> &'static str { &get().auto_switch_english_k
 pub fn auto_switch_settle_ms() -> u64 { get().auto_switch_settle_ms }
 pub fn auto_switch_app_rule(process_name: &str) -> Option<&'static str> {
     get().auto_switch_app_rules.get(&process_name.to_lowercase()).map(String::as_str)
+}
+pub fn auto_switch_extra_input_apps() -> &'static [String] {
+    &get().auto_switch_extra_input_apps
 }
 pub fn caret_enable() -> bool { get().caret_enable }
 pub fn caret_color_cn() -> u32 { get().caret_color_cn }

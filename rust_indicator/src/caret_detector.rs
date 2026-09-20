@@ -31,6 +31,18 @@ const IID_IACCESSIBLE: u128 = 0x618736e0_3c3d_11cf_810c_00aa00389b71;
 /// 它们已有可靠的 Win32/MSAA Caret，因此直接使用 Caret 状态判断输入区。
 const CARET_FAST_PATH_APPS: &[&str] = &["Weixin.exe"];
 
+/// 浏览器和富文本应用常把真正的编辑区暴露为 Custom/Text/Group，而不是标准 Edit。
+/// 仅对这些已验证应用允许用当前线程的真实 Caret 补足 UIA，避免重新放宽到所有
+/// 自绘程序（eCloud、FlClash 等会在非输入区保留假的 Caret）。
+const CARET_COMPAT_APPS: &[&str] = &[
+    "chrome.exe",
+    "msedge.exe",
+    "firefox.exe",
+    "Tabbit Browser.exe",
+    "Feishu.exe",
+    "Lark.exe",
+];
+
 // ============================================================================
 // 类型定义
 // ============================================================================
@@ -130,9 +142,11 @@ impl CaretDetector {
                 focused_hwnd.0 as usize
             );
 
+            let process_name = process_name(process_id).unwrap_or_default();
+
             // 微信等自绘应用的 UIA GetFocusedElement 会卡住约 3 秒，并且最终只返回
             // 顶层窗口。Win32/MSAA Caret 已能可靠反映聊天框和搜索框是否可输入。
-            if is_caret_fast_path_process(process_id) {
+            if process_matches(&process_name, CARET_FAST_PATH_APPS) {
                 return FocusContext {
                     identity: fallback_identity,
                     foreground_hwnd,
@@ -175,21 +189,26 @@ impl CaretDetector {
             let value_is_readonly = value_pattern.as_ref()
                 .and_then(|vp| vp.CurrentIsReadOnly().ok())
                 .map(|v| v.as_bool());
+            let caret_compat = process_matches(&process_name, CARET_COMPAT_APPS)
+                || crate::config::auto_switch_extra_input_apps()
+                    .iter()
+                    .any(|candidate| process_name.eq_ignore_ascii_case(candidate));
             let editable = if password {
                 true
             } else if control_type == UIA_EditControlTypeId {
                 value_is_readonly != Some(true)
             } else if control_type == UIA_DocumentControlTypeId {
                 // 浏览器正文有时会残留可定位的 caret，但只读 Document 仍不能输入。
-                // Word/contenteditable 会暴露非只读 ValuePattern。
+                // Word/contenteditable 优先使用 ValuePattern；部分 Chromium 富文本区
+                // 不提供 ValuePattern，只对兼容应用接受真实 Caret。
                 value_is_readonly == Some(false)
+                    || (value_is_readonly.is_none() && has_caret && caret_compat)
             } else {
-                // UIA 已明确返回按钮、窗格、列表等非编辑控件时，不再相信可能残留的
-                // Win32 Caret。UIA 查询失败以及兼容列表中的自绘应用仍走 Caret 回退。
-                false
+                // 富文本编辑器和飞书输入区经常是 Custom/Text/Group；只在兼容列表中
+                // 使用 Caret 回退。其他应用保持严格模式，防止非输入区的黄色假点。
+                has_caret && caret_compat
             };
-            let readonly_document = control_type == UIA_DocumentControlTypeId
-                && value_is_readonly != Some(false);
+            let readonly_document = control_type == UIA_DocumentControlTypeId && !editable;
 
             let native_hwnd = focused.CurrentNativeWindowHandle().unwrap_or_default();
             let identity = if let Some(runtime_id) = uia_runtime_id(&focused) {
@@ -353,12 +372,10 @@ impl CaretDetector {
     }
 }
 
-fn is_caret_fast_path_process(process_id: u32) -> bool {
-    process_name(process_id).map_or(false, |name| {
-        CARET_FAST_PATH_APPS
-            .iter()
-            .any(|candidate| name.eq_ignore_ascii_case(candidate))
-    })
+fn process_matches(process_name: &str, candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| process_name.eq_ignore_ascii_case(candidate))
 }
 
 fn process_name(process_id: u32) -> Option<String> {
@@ -387,13 +404,20 @@ fn process_name(process_id: u32) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::CARET_FAST_PATH_APPS;
+    use super::{process_matches, CARET_COMPAT_APPS, CARET_FAST_PATH_APPS};
 
     #[test]
     fn wechat_uses_caret_fast_path() {
-        assert!(CARET_FAST_PATH_APPS
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case("weixin.exe")));
+        assert!(process_matches("weixin.exe", CARET_FAST_PATH_APPS));
+    }
+
+    #[test]
+    fn rich_text_apps_use_scoped_caret_fallback() {
+        assert!(process_matches("chrome.exe", CARET_COMPAT_APPS));
+        assert!(process_matches("Tabbit Browser.exe", CARET_COMPAT_APPS));
+        assert!(process_matches("Feishu.exe", CARET_COMPAT_APPS));
+        assert!(!process_matches("eCloud.exe", CARET_COMPAT_APPS));
+        assert!(!process_matches("FlClash.exe", CARET_COMPAT_APPS));
     }
 }
 
