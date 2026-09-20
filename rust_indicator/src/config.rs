@@ -50,7 +50,7 @@ impl Default for Config {
             auto_switch_enable: true,
             auto_switch_chinese_klid: "00000804".to_string(),
             auto_switch_english_klid: "00000409".to_string(),
-            auto_switch_settle_ms: 150,
+            auto_switch_settle_ms: 80,
             auto_switch_app_rules: HashMap::new(),
             caret_enable: true,
             caret_color_cn: parse_color("#FF7800A0"),
@@ -245,7 +245,7 @@ enable = true               # 是否显示托盘图标 (false 时完全后台运
 enable = true               # 是否按焦点上下文自动切换输入法
 chinese_klid = "00000804"  # 当前系统启用的简体中文输入法
 english_klid = "00000409"  # 英语（美国）键盘
-settle_ms = 150             # 焦点稳定多久后切换，避免快速切换时抖动
+settle_ms = 80              # 焦点稳定多久后切换；低于一次状态轮询可在下一轮立即响应
 # 按进程名覆盖默认行为，可选 auto/chinese/english/ignore；规则只在上下文变化时执行一次
 # app_rules = ["WindowsTerminal.exe=english", "Obsidian.exe=chinese", "game.exe=ignore"]
 app_rules = []

@@ -1,15 +1,21 @@
 //! 文本光标位置检测模块 - 多级检测策略
 
 
-use windows::Win32::Foundation::{HWND, POINT};
+use std::path::Path;
+
+use windows::core::{Interface, PWSTR};
+use windows::Win32::Foundation::{CloseHandle, HWND, POINT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED};
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::Accessibility::CUIAutomation;
 use windows::Win32::UI::Accessibility::IUIAutomation;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
 };
-use windows::core::Interface;
 
 // ============================================================================
 // 常量定义
@@ -20,6 +26,10 @@ const OBJID_CARET: u32 = 0xFFFFFFF8u32;
 
 /// IID_IAccessible GUID: {618736e0-3c3d-11cf-810c-00aa00389b71}
 const IID_IACCESSIBLE: u128 = 0x618736e0_3c3d_11cf_810c_00aa00389b71;
+
+/// 这些自绘应用不暴露可靠的 UIA 子控件；查询焦点元素会阻塞数秒。
+/// 它们已有可靠的 Win32/MSAA Caret，因此直接使用 Caret 状态判断输入区。
+const CARET_FAST_PATH_APPS: &[&str] = &["Weixin.exe"];
 
 // ============================================================================
 // 类型定义
@@ -97,6 +107,14 @@ impl CaretDetector {
         use windows::Win32::UI::Accessibility::{
             IUIAutomationValuePattern, UIA_DocumentControlTypeId, UIA_ValuePatternId,
         };
+        let mut process_id = 0u32;
+        unsafe {
+            GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut process_id));
+        }
+        if is_caret_fast_path_process(process_id) {
+            return false;
+        }
+
         let Some(automation) = self.automation.as_ref() else {
             return false;
         };
@@ -146,6 +164,20 @@ impl CaretDetector {
                 foreground_hwnd.0 as usize,
                 focused_hwnd.0 as usize
             );
+
+            // 微信等自绘应用的 UIA GetFocusedElement 会卡住约 3 秒，并且最终只返回
+            // 顶层窗口。Win32/MSAA Caret 已能可靠反映聊天框和搜索框是否可输入。
+            if is_caret_fast_path_process(process_id) {
+                return FocusContext {
+                    identity: fallback_identity,
+                    foreground_hwnd,
+                    focused_hwnd,
+                    process_id,
+                    editable: has_caret,
+                    password: false,
+                };
+            }
+
             let Some(automation) = self.automation.as_ref() else {
                 return FocusContext {
                     identity: fallback_identity,
@@ -345,6 +377,50 @@ impl CaretDetector {
                 }
             }
         }
+    }
+}
+
+fn is_caret_fast_path_process(process_id: u32) -> bool {
+    process_name(process_id).map_or(false, |name| {
+        CARET_FAST_PATH_APPS
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate))
+    })
+}
+
+fn process_name(process_id: u32) -> Option<String> {
+    if process_id == 0 {
+        return None;
+    }
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id).ok()?;
+        let mut buffer = [0u16; 1024];
+        let mut len = buffer.len() as u32;
+        let result = QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut len,
+        );
+        let _ = CloseHandle(process);
+        result.ok()?;
+        let full_path = String::from_utf16_lossy(&buffer[..len as usize]);
+        Path::new(&full_path)
+            .file_name()?
+            .to_str()
+            .map(str::to_string)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CARET_FAST_PATH_APPS;
+
+    #[test]
+    fn wechat_uses_caret_fast_path() {
+        assert!(CARET_FAST_PATH_APPS
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("weixin.exe")));
     }
 }
 

@@ -52,7 +52,7 @@
 enable = true
 chinese_klid = "00000804"
 english_klid = "00000409"
-settle_ms = 150
+settle_ms = 80
 app_rules = ["WindowsTerminal.exe=english", "Obsidian.exe=chinese", "game.exe=ignore"]
 ```
 
