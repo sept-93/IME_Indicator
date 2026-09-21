@@ -4,4 +4,4 @@
 
 GitHub: https://github.com/sept-93/IME_Indicator
 作者：Antigravity & Haujet
-版本：v0.6.1
+版本：v0.6.2

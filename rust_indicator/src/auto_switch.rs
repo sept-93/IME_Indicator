@@ -53,6 +53,8 @@ pub struct AutoSwitcher {
     candidate_since: Instant,
     applied_context: Option<SwitchContextKey>,
     enabled_last: bool,
+    last_switch_attempt: Instant,
+    english_retry_used: bool,
 }
 
 impl AutoSwitcher {
@@ -62,10 +64,12 @@ impl AutoSwitcher {
             candidate_since: Instant::now(),
             applied_context: None,
             enabled_last: crate::tray::smart_switch_enabled(),
+            last_switch_attempt: Instant::now(),
+            english_retry_used: false,
         }
     }
 
-    pub fn observe(&mut self, context: FocusContext) {
+    pub fn observe(&mut self, context: FocusContext, chinese_mode: bool) {
         let enabled = crate::tray::smart_switch_enabled();
         if !enabled {
             self.enabled_last = false;
@@ -85,6 +89,7 @@ impl AutoSwitcher {
         if changed {
             self.candidate = Some(context);
             self.candidate_since = Instant::now();
+            self.english_retry_used = false;
             // 输入框和搜索框优先响应：一旦检测到 Caret/Edit/Document 焦点，
             // 本轮立即切换。非输入区仍保留短暂防抖，避免切窗口时闪动。
             if !self
@@ -110,13 +115,6 @@ impl AutoSwitcher {
             return;
         };
         let context_key = SwitchContextKey::from(context);
-        if self.applied_context.as_ref() == Some(&context_key) {
-            return;
-        }
-
-        // 无论切换成功与否，本上下文都只尝试一次，避免不兼容窗口被循环轰炸。
-        self.applied_context = Some(context_key);
-
         let process_name = process_name(context.process_id).unwrap_or_default();
         let rule = crate::config::auto_switch_app_rule(&process_name)
             .unwrap_or_else(|| default_rule_for_process(&process_name));
@@ -124,15 +122,46 @@ impl AutoSwitcher {
             return;
         };
 
+        let already_applied = self.applied_context.as_ref() == Some(&context_key);
+        if already_applied
+            && !should_retry_english(
+                target,
+                chinese_mode,
+                self.english_retry_used,
+                self.last_switch_attempt.elapsed(),
+            )
+        {
+            return;
+        }
+
+        if already_applied {
+            self.english_retry_used = true;
+        } else {
+            self.applied_context = Some(context_key);
+        }
+
         let _ = switch_language(context.focused_hwnd, context.foreground_hwnd, target);
+        self.last_switch_attempt = Instant::now();
     }
 }
 
+fn should_retry_english(
+    target: LanguageTarget,
+    chinese_mode: bool,
+    retry_used: bool,
+    elapsed: Duration,
+) -> bool {
+    target == LanguageTarget::English
+        && chinese_mode
+        && !retry_used
+        && elapsed >= Duration::from_millis(250)
+}
+
 fn default_rule_for_process(process_name: &str) -> &'static str {
-    // C4D 保留输入状态识别和提示，但不向它的自绘消息循环发送语言切换请求。
-    // 用户可以在“应用规则”里显式选择其他规则覆盖此默认值。
+    // C4D 进入主界面时恢复英文；进入重命名区后不强制语言，只显示用户手动
+    // 选择的中英文状态，避免向其自绘输入循环持续发送切换请求。
     if process_name.eq_ignore_ascii_case("Cinema 4D.exe") {
-        "ignore"
+        "c4d_manual"
     } else {
         "auto"
     }
@@ -141,6 +170,8 @@ fn default_rule_for_process(process_name: &str) -> &'static str {
 fn target_for(rule: &str, password: bool, editable: bool) -> Option<LanguageTarget> {
     match rule {
         "ignore" => None,
+        "c4d_manual" if editable => None,
+        "c4d_manual" => Some(LanguageTarget::English),
         "chinese" => Some(LanguageTarget::Chinese),
         "english" => Some(LanguageTarget::English),
         _ if password => Some(LanguageTarget::English),
@@ -235,7 +266,12 @@ fn send_ime_control(hwnd: HWND, command: usize, value: isize) {
 mod tests {
     use windows::Win32::Foundation::HWND;
 
-    use super::{default_rule_for_process, target_for, LanguageTarget, SwitchContextKey};
+    use std::time::Duration;
+
+    use super::{
+        default_rule_for_process, should_retry_english, target_for, LanguageTarget,
+        SwitchContextKey,
+    };
     use crate::caret_detector::FocusContext;
 
     fn context(editable: bool, password: bool) -> FocusContext {
@@ -282,8 +318,13 @@ mod tests {
 
     #[test]
     fn cinema_4d_is_indicator_only_by_default() {
-        assert_eq!(default_rule_for_process("Cinema 4D.exe"), "ignore");
+        assert_eq!(default_rule_for_process("Cinema 4D.exe"), "c4d_manual");
         assert_eq!(default_rule_for_process("Photoshop.exe"), "auto");
+        assert_eq!(
+            target_for("c4d_manual", false, false),
+            Some(LanguageTarget::English)
+        );
+        assert_eq!(target_for("c4d_manual", false, true), None);
     }
 
     #[test]
@@ -299,5 +340,27 @@ mod tests {
             SwitchContextKey::from(&input),
             SwitchContextKey::from(&input)
         );
+    }
+
+    #[test]
+    fn english_target_gets_only_one_delayed_correction() {
+        assert!(should_retry_english(
+            LanguageTarget::English,
+            true,
+            false,
+            Duration::from_millis(300)
+        ));
+        assert!(!should_retry_english(
+            LanguageTarget::English,
+            true,
+            true,
+            Duration::from_secs(1)
+        ));
+        assert!(!should_retry_english(
+            LanguageTarget::Chinese,
+            false,
+            false,
+            Duration::from_secs(1)
+        ));
     }
 }

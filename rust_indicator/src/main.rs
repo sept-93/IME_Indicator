@@ -159,7 +159,7 @@ fn run_detector_loop(running: Arc<AtomicBool>) {
             let focus_editable = focus_context.editable;
             let readonly_document = focus_context.readonly_document;
             let force_mouse_indicator = focus_context.force_mouse_indicator;
-            auto_switcher.observe(focus_context);
+            auto_switcher.observe(focus_context, chinese_mode);
 
             // 未识别控件中手动切换输入法时，也在鼠标旁短暂显示当前颜色，避免
             // “已经切成中文/英文但完全没有标识”的情况，同时不恢复全局常驻假点。
