@@ -2,7 +2,6 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 use windows::core::{Interface, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HWND, POINT};
@@ -19,7 +18,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_F2, VK_LBUTTON, VK_RETURN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
+    GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
 };
 
 // ============================================================================
@@ -120,7 +119,6 @@ pub struct CaretDetector {
     f2_down: bool,
     left_down: bool,
     v_down: bool,
-    last_left_click: Option<(Instant, u32, i32, i32)>,
 }
 
 impl CaretDetector {
@@ -147,7 +145,6 @@ impl CaretDetector {
             f2_down: false,
             left_down: false,
             v_down: false,
-            last_left_click: None,
         }
     }
 
@@ -321,24 +318,6 @@ impl CaretDetector {
         self.left_down = left_now;
         self.v_down = v_now;
 
-        let double_clicked = if left_pressed {
-            let mut point = POINT::default();
-            let has_point = unsafe { GetCursorPos(&mut point).is_ok() };
-            let is_double = has_point
-                && self.last_left_click.is_some_and(|(when, pid, x, y)| {
-                    pid == process_id
-                        && when.elapsed() <= Duration::from_millis(550)
-                        && (point.x - x).abs() <= 8
-                        && (point.y - y).abs() <= 8
-                });
-            if has_point {
-                self.last_left_click = Some((Instant::now(), process_id, point.x, point.y));
-            }
-            is_double
-        } else {
-            false
-        };
-
         if process_id == 0 {
             return false;
         }
@@ -354,11 +333,6 @@ impl CaretDetector {
             } else if t_pressed && !has_caret {
                 // T 只选择文字工具；等用户真正点击画布文字位置后才进入中文。
                 self.design_text_tools.insert(process_id);
-            } else if double_clicked && !crate::cursor_detector::is_standard_arrow_cursor() {
-                // 使用移动/选择工具双击已有文字时，Photoshop/Illustrator 不会创建
-                // Windows Caret。把非标准设计光标下的双击视为进入已有文字编辑。
-                self.design_text_tools.insert(process_id);
-                self.design_text_processes.insert(process_id);
             } else if self.design_text_tools.contains(&process_id) && left_pressed {
                 if crate::cursor_detector::is_standard_arrow_cursor() {
                     // 点击图层、工具栏等普通界面立即离开输入态，保证快捷键使用英文。

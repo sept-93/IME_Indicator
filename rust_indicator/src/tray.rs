@@ -3,7 +3,7 @@ use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, LRESULT, TRUE,
 use windows::Win32::Graphics::GdiPlus::{
     GdipCreateBitmapFromFile, GdipCreateHICONFromBitmap, GdipDisposeImage,
 };
-use windows::Win32::Graphics::Gdi::{HBRUSH, COLOR_WINDOW};
+use windows::Win32::Graphics::Gdi::{GetStockObject, HBRUSH, COLOR_WINDOW, DEFAULT_GUI_FONT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
@@ -18,13 +18,13 @@ use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows,
-    GetCursorPos, GetMessageW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-    IsWindowVisible, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW,
+    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
+    EnumChildWindows, EnumWindows, GetCursorPos, GetMessageW, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsWindowVisible, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW,
     SetForegroundWindow, ShowWindow, TrackPopupMenu, TranslateMessage, CBS_DROPDOWNLIST,
     CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CW_USEDEFAULT, HICON, HMENU, LBS_NOTIFY,
     LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, MSG, SW_SHOW, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
-    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_NULL, WM_RBUTTONUP, WM_USER, WNDCLASSW,
+    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_NULL, WM_RBUTTONUP, WM_SETFONT, WM_USER, WNDCLASSW,
     WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
@@ -615,6 +615,15 @@ fn show_app_rule_editor() {
             None,
         );
 
+        // 未显式设置字体时，原生 LISTBOX/COMBOBOX 会退回难看的等宽系统字体。
+        // 给全部子控件统一使用 Windows 默认界面字体，并立即重绘。
+        let font = GetStockObject(DEFAULT_GUI_FONT);
+        let _ = EnumChildWindows(
+            hwnd,
+            Some(set_default_gui_font),
+            LPARAM(font.0 as isize),
+        );
+
         APP_RULE_EDITOR.with(|state| {
             *state.borrow_mut() = Some(AppRuleEditorState {
                 hwnd,
@@ -627,6 +636,16 @@ fn show_app_rule_editor() {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
     }
+}
+
+unsafe extern "system" fn set_default_gui_font(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let _ = SendMessageW(
+        hwnd,
+        WM_SETFONT,
+        WPARAM(lparam.0 as usize),
+        LPARAM(1),
+    );
+    TRUE
 }
 
 unsafe extern "system" fn app_rule_window_proc(

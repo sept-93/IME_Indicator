@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 use windows::core::w;
 use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
 
 static INSTANCE_MUTEX: AtomicIsize = AtomicIsize::new(0);
 
@@ -27,6 +28,17 @@ pub fn acquire() -> bool {
 
         INSTANCE_MUTEX.store(handle.0 as isize, Ordering::Release);
         true
+    }
+}
+
+pub fn show_already_running() {
+    unsafe {
+        MessageBoxW(
+            None,
+            w!("输入指示器已经在运行中，请查看右下角托盘图标。"),
+            w!("输入指示器"),
+            MB_ICONINFORMATION | MB_OK,
+        );
     }
 }
 

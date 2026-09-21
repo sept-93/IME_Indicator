@@ -25,6 +25,7 @@ use tray::TrayManager;
 
 fn main() {
     if !single_instance::acquire() {
+        single_instance::show_already_running();
         return;
     }
 
