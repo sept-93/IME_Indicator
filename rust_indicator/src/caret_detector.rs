@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use windows::core::{Interface, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HWND, POINT};
@@ -18,7 +19,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_LBUTTON, VK_RETURN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
+    GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
 };
 
 // ============================================================================
@@ -59,6 +60,9 @@ const CARET_COMPAT_APPS: &[&str] = &[
     "Tabbit Browser.exe",
     "Feishu.exe",
     "Lark.exe",
+    "wps.exe",
+    "et.exe",
+    "wpp.exe",
 ];
 
 /// Photoshop/Illustrator 的画布文字光标完全由应用绘制，Windows 没有 Caret 对象。
@@ -121,6 +125,7 @@ pub struct CaretDetector {
     enter_down: bool,
     left_down: bool,
     v_down: bool,
+    last_left_click: Option<(Instant, u32, i32, i32)>,
 }
 
 impl CaretDetector {
@@ -146,6 +151,7 @@ impl CaretDetector {
             enter_down: false,
             left_down: false,
             v_down: false,
+            last_left_click: None,
         }
     }
 
@@ -321,10 +327,14 @@ impl CaretDetector {
         }
 
         if process_matches(process_name, DESIGN_TEXT_SHORTCUT_APPS) {
+            // 切换 Adobe 进程后不沿用另一个窗口/进程的文字工具状态。
+            self.design_text_processes.retain(|pid| *pid == process_id);
+            self.design_text_tools.retain(|pid| *pid == process_id);
             let was_active = self.design_text_processes.contains(&process_id);
             if escape_pressed || (ctrl_now && enter_pressed) {
                 self.design_text_processes.remove(&process_id);
-                // 第一次 Esc 结束文字编辑但保留文字工具；第二次 Esc 完全退出工具。
+                // Esc/Ctrl+Enter 一次就结束输入态，下一轮上下文立即回到英文。
+                self.last_left_click = None;
                 if escape_pressed && !was_active {
                     self.design_text_tools.remove(&process_id);
                 }
@@ -339,12 +349,39 @@ impl CaretDetector {
                     // 文字工具选中时，点击画布的文字光标位置才进入中文输入态。
                     self.design_text_processes.insert(process_id);
                 }
+            } else if left_pressed {
+                // 双击已有文字重新进入编辑时，Photoshop/Illustrator 不公开系统 Caret。
+                // 只接受同一进程、同一位置附近的快速双击，避免普通界面单击被误判中文。
+                let mut point = POINT::default();
+                let have_point = unsafe { GetCursorPos(&mut point).is_ok() };
+                let double_click = have_point
+                    && self
+                        .last_left_click
+                        .as_ref()
+                        .is_some_and(|(at, pid, x, y)| {
+                            *pid == process_id
+                                && at.elapsed() <= Duration::from_millis(500)
+                                && (point.x - *x).abs() <= 8
+                                && (point.y - *y).abs() <= 8
+                        });
+                self.last_left_click =
+                    have_point.then_some((Instant::now(), process_id, point.x, point.y));
+                if double_click && !crate::cursor_detector::is_standard_arrow_cursor() {
+                    self.design_text_tools.insert(process_id);
+                    self.design_text_processes.insert(process_id);
+                    self.last_left_click = None;
+                } else if crate::cursor_detector::is_standard_arrow_cursor() {
+                    self.design_text_processes.remove(&process_id);
+                }
             } else if !was_active && v_pressed {
                 self.design_text_tools.remove(&process_id);
             }
             return self.design_text_processes.contains(&process_id);
         }
 
+        self.design_text_processes.clear();
+        self.design_text_tools.clear();
+        self.last_left_click = None;
         false
     }
 
@@ -488,8 +525,7 @@ fn foreground_process_matches(candidates: &[&str]) -> bool {
         let hwnd = GetForegroundWindow();
         let mut process_id = 0u32;
         GetWindowThreadProcessId(hwnd, Some(&mut process_id));
-        process_name(process_id)
-            .is_some_and(|name| process_matches(&name, candidates))
+        process_name(process_id).is_some_and(|name| process_matches(&name, candidates))
     }
 }
 
@@ -549,6 +585,9 @@ mod tests {
         assert!(process_matches("chrome.exe", CARET_COMPAT_APPS));
         assert!(process_matches("Tabbit Browser.exe", CARET_COMPAT_APPS));
         assert!(process_matches("Feishu.exe", CARET_COMPAT_APPS));
+        assert!(process_matches("wps.exe", CARET_COMPAT_APPS));
+        assert!(process_matches("et.exe", CARET_COMPAT_APPS));
+        assert!(process_matches("wpp.exe", CARET_COMPAT_APPS));
         assert!(!process_matches("Photoshop.exe", CARET_COMPAT_APPS));
         assert!(!process_matches("Illustrator.exe", CARET_COMPAT_APPS));
         assert!(!process_matches("Cinema 4D.exe", CARET_COMPAT_APPS));

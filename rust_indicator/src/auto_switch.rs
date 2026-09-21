@@ -116,8 +116,14 @@ impl AutoSwitcher {
         };
         let context_key = SwitchContextKey::from(context);
         let process_name = process_name(context.process_id).unwrap_or_default();
-        let rule = crate::config::auto_switch_app_rule(&process_name)
-            .unwrap_or_else(|| default_rule_for_process(&process_name));
+        // C4D 必须彻底绕过自动切换，即使旧配置里曾保存过 auto/chinese/english，
+        // 也不能向其自绘消息循环发送跨进程输入语言消息。
+        let rule = if process_name.eq_ignore_ascii_case("Cinema 4D.exe") {
+            "ignore"
+        } else {
+            crate::config::auto_switch_app_rule(&process_name)
+                .unwrap_or_else(|| default_rule_for_process(&process_name))
+        };
         let Some(target) = target_for(rule, context.password, context.editable) else {
             return;
         };

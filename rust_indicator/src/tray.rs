@@ -1,12 +1,12 @@
-use windows::core::{w, PCWSTR};
+use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, LRESULT, TRUE, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    CreateFontW, DeleteObject, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW,
+    DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, HBRUSH, HFONT,
+    OUT_DEFAULT_PRECIS,
+};
 use windows::Win32::Graphics::GdiPlus::{
     GdipCreateBitmapFromFile, GdipCreateHICONFromBitmap, GdipDisposeImage,
-};
-use windows::Win32::Graphics::Gdi::{
-    CreateFontW, DeleteObject, HFONT, HBRUSH, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
-    COLOR_WINDOW, DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD,
-    OUT_DEFAULT_PRECIS,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{
@@ -18,24 +18,32 @@ use windows::Win32::System::Threading::{
     GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows::Win32::UI::Controls::{
+    ImageList_Create, ImageList_Destroy, ImageList_ReplaceIcon, InitCommonControlsEx, HIMAGELIST,
+    ICC_LISTVIEW_CLASSES, ILC_COLOR32, ILC_MASK, INITCOMMONCONTROLSEX, LVCF_WIDTH, LVCOLUMNW,
+    LVIF_IMAGE, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
+    LVM_INSERTITEMW, LVM_SETIMAGELIST, LVNI_SELECTED, LVSIL_SMALL, LVS_NOCOLUMNHEADER, LVS_REPORT,
+    LVS_SHOWSELALWAYS, LVS_SINGLESEL,
+};
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+    SHGetFileInfoW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+    NOTIFYICONDATAW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    EnumChildWindows, EnumWindows, GetCursorPos, GetMessageW, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW,
-    SetForegroundWindow, ShowWindow, TrackPopupMenu, TranslateMessage, BM_GETCHECK, BM_SETCHECK,
-    BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, CW_USEDEFAULT, HICON, HMENU, LBS_NOINTEGRALHEIGHT,
-    LBS_NOTIFY, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETITEMHEIGHT, MSG, SW_SHOW,
+    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW,
+    EnumChildWindows, EnumWindows, GetCursorPos, GetMessageW, GetWindowTextLengthW,
+    GetWindowThreadProcessId, IsWindowVisible, PostMessageW, PostQuitMessage, RegisterClassW,
+    SendMessageW, SetForegroundWindow, ShowWindow, TrackPopupMenu, TranslateMessage, BM_GETCHECK,
+    BM_SETCHECK, BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, CW_USEDEFAULT, HICON, HMENU, MSG, SW_SHOW,
     TPM_BOTTOMALIGN, TPM_LEFTALIGN, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_NULL,
-    WM_RBUTTONUP, WM_SETFONT, WM_USER, WNDCLASSW, WS_CHILD,
-    WS_EX_CLIENTEDGE, WS_GROUP, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    WM_RBUTTONUP, WM_SETFONT, WM_USER, WNDCLASSW, WS_CHILD, WS_EX_CLIENTEDGE, WS_GROUP,
+    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::path::Path;
+use std::os::windows::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const WM_TRAYICON: u32 = WM_USER + 1;
@@ -63,6 +71,7 @@ static MENU_OPEN: AtomicBool = AtomicBool::new(false);
 struct RunningApp {
     exe_name: String,
     display_name: String,
+    exe_path: PathBuf,
 }
 
 struct AppRuleEditorState {
@@ -71,6 +80,7 @@ struct AppRuleEditorState {
     rule_buttons: Vec<HWND>,
     font: HFONT,
     title_font: HFONT,
+    image_list: Option<HIMAGELIST>,
     apps: Vec<RunningApp>,
 }
 
@@ -478,6 +488,11 @@ fn show_app_rule_editor() {
             show_error("无法创建应用规则窗口。");
             return;
         };
+        let common_controls = INITCOMMONCONTROLSEX {
+            dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_LISTVIEW_CLASSES,
+        };
+        let _ = InitCommonControlsEx(&common_controls);
         let class_name = w!("IMEIndicatorAppRulesClass");
         let window_class = WNDCLASSW {
             lpfnWndProc: Some(app_rule_window_proc),
@@ -495,8 +510,8 @@ fn show_app_rule_editor() {
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            690,
-            590,
+            410,
+            560,
             None,
             None,
             h_instance,
@@ -511,24 +526,25 @@ fn show_app_rule_editor() {
             w!("STATIC"),
             w!("应用规则"),
             WS_CHILD | WS_VISIBLE,
-            24,
-            18,
-            300,
-            32,
+            16,
+            14,
+            240,
+            28,
             hwnd,
             None,
             h_instance,
             None,
-        ).ok();
+        )
+        .ok();
         let _ = CreateWindowExW(
             Default::default(),
             w!("STATIC"),
-            w!("选择一个当前已打开的应用，再指定它的输入法处理方式。"),
+            w!("选择已打开的应用并设置处理方式。"),
             WS_CHILD | WS_VISIBLE,
-            24,
-            52,
-            620,
-            24,
+            16,
+            44,
+            360,
+            22,
             hwnd,
             None,
             h_instance,
@@ -536,17 +552,16 @@ fn show_app_rule_editor() {
         );
         let Ok(list) = CreateWindowExW(
             WS_EX_CLIENTEDGE,
-            w!("LISTBOX"),
+            w!("SysListView32"),
             None,
             WS_CHILD
                 | WS_VISIBLE
                 | WS_TABSTOP
-                | WS_VSCROLL
-                | WINDOW_STYLE((LBS_NOTIFY | LBS_NOINTEGRALHEIGHT) as u32),
-            24,
-            82,
-            636,
-            300,
+                | WINDOW_STYLE(LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOCOLUMNHEADER),
+            16,
+            72,
+            362,
+            286,
             hwnd,
             HMENU(IDC_APP_LIST as usize as *mut _),
             h_instance,
@@ -556,15 +571,26 @@ fn show_app_rule_editor() {
             show_error("无法创建应用列表。");
             return;
         };
+        let column = LVCOLUMNW {
+            mask: LVCF_WIDTH,
+            cx: 340,
+            ..Default::default()
+        };
+        let _ = SendMessageW(
+            list,
+            LVM_INSERTCOLUMNW,
+            WPARAM(0),
+            LPARAM((&column as *const LVCOLUMNW) as isize),
+        );
         let _ = CreateWindowExW(
             Default::default(),
             w!("STATIC"),
             w!("处理方式"),
             WS_CHILD | WS_VISIBLE,
-            24,
-            398,
+            16,
+            368,
             120,
-            24,
+            22,
             hwnd,
             None,
             h_instance,
@@ -579,23 +605,38 @@ fn show_app_rule_editor() {
             "忽略此应用",
             "删除自定义规则",
         ];
-        let widths = [140, 100, 100, 115, 145];
-        let mut x = 24;
+        let positions = [
+            (16, 394, 140),
+            (154, 394, 100),
+            (252, 394, 100),
+            (16, 422, 120),
+            (138, 422, 150),
+        ];
         for (index, label) in rule_labels.iter().enumerate() {
-            let group = if index == 0 { WS_GROUP } else { WINDOW_STYLE(0) };
+            let group = if index == 0 {
+                WS_GROUP
+            } else {
+                WINDOW_STYLE(0)
+            };
             let Ok(button) = CreateWindowExW(
                 Default::default(),
                 w!("BUTTON"),
-                PCWSTR(label.encode_utf16().chain(Some(0)).collect::<Vec<_>>().as_ptr()),
+                PCWSTR(
+                    label
+                        .encode_utf16()
+                        .chain(Some(0))
+                        .collect::<Vec<_>>()
+                        .as_ptr(),
+                ),
                 WS_CHILD
                     | WS_VISIBLE
                     | WS_TABSTOP
                     | group
                     | WINDOW_STYLE(BS_AUTORADIOBUTTON as u32),
-                x,
-                426,
-                widths[index],
-                28,
+                positions[index].0,
+                positions[index].1,
+                positions[index].2,
+                24,
                 hwnd,
                 HMENU((IDC_RULE_FIRST + index as u32) as usize as *mut _),
                 h_instance,
@@ -606,7 +647,6 @@ fn show_app_rule_editor() {
                 return;
             };
             rule_buttons.push(button);
-            x += widths[index];
         }
         let _ = SendMessageW(rule_buttons[0], BM_SETCHECK, WPARAM(1), LPARAM(0));
 
@@ -615,10 +655,10 @@ fn show_app_rule_editor() {
             w!("BUTTON"),
             w!("刷新列表"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            382,
-            472,
-            128,
-            36,
+            166,
+            462,
+            100,
+            32,
             hwnd,
             HMENU(IDC_REFRESH_APPS as usize as *mut _),
             h_instance,
@@ -629,10 +669,10 @@ fn show_app_rule_editor() {
             w!("BUTTON"),
             w!("保存并应用"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
-            524,
-            472,
-            136,
-            36,
+            276,
+            462,
+            102,
+            32,
             hwnd,
             HMENU(IDC_SAVE_RULE as usize as *mut _),
             h_instance,
@@ -641,12 +681,12 @@ fn show_app_rule_editor() {
         let _ = CreateWindowExW(
             Default::default(),
             w!("STATIC"),
-            w!("提示：自动识别只补充输入框检测；固定规则会覆盖输入框与非输入区判断。"),
+            w!("提示：自动识别仅补充输入框检测。"),
             WS_CHILD | WS_VISIBLE,
-            24,
-            516,
-            636,
-            24,
+            16,
+            505,
+            362,
+            22,
             hwnd,
             None,
             h_instance,
@@ -655,21 +695,11 @@ fn show_app_rule_editor() {
 
         // 未显式设置字体时，原生 LISTBOX/COMBOBOX 会退回难看的等宽系统字体。
         // 给全部子控件统一使用 Windows 默认界面字体，并立即重绘。
-        let font = create_ui_font(-14, FW_NORMAL.0 as i32);
-        let title_font = create_ui_font(-18, FW_SEMIBOLD.0 as i32);
-        let _ = EnumChildWindows(
-            hwnd,
-            Some(set_default_gui_font),
-            LPARAM(font.0 as isize),
-        );
-        let _ = SendMessageW(list, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(22));
+        let font = create_ui_font(-12, FW_NORMAL.0 as i32);
+        let title_font = create_ui_font(-16, FW_SEMIBOLD.0 as i32);
+        let _ = EnumChildWindows(hwnd, Some(set_default_gui_font), LPARAM(font.0 as isize));
         if let Some(header) = header {
-            let _ = SendMessageW(
-                header,
-                WM_SETFONT,
-                WPARAM(title_font.0 as usize),
-                LPARAM(1),
-            );
+            let _ = SendMessageW(header, WM_SETFONT, WPARAM(title_font.0 as usize), LPARAM(1));
         }
 
         APP_RULE_EDITOR.with(|state| {
@@ -679,6 +709,7 @@ fn show_app_rule_editor() {
                 rule_buttons,
                 font,
                 title_font,
+                image_list: None,
                 apps: Vec::new(),
             });
         });
@@ -708,12 +739,7 @@ unsafe fn create_ui_font(height: i32, weight: i32) -> HFONT {
 }
 
 unsafe extern "system" fn set_default_gui_font(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let _ = SendMessageW(
-        hwnd,
-        WM_SETFONT,
-        WPARAM(lparam.0 as usize),
-        LPARAM(1),
-    );
+    let _ = SendMessageW(hwnd, WM_SETFONT, WPARAM(lparam.0 as usize), LPARAM(1));
     TRUE
 }
 
@@ -741,6 +767,9 @@ unsafe extern "system" fn app_rule_window_proc(
                 let mut state = state.borrow_mut();
                 if state.as_ref().is_some_and(|editor| editor.hwnd == hwnd) {
                     if let Some(editor) = state.take() {
+                        if let Some(image_list) = editor.image_list {
+                            let _ = ImageList_Destroy(image_list);
+                        }
                         let _ = DeleteObject(editor.font);
                         let _ = DeleteObject(editor.title_font);
                     }
@@ -758,14 +787,36 @@ fn refresh_running_apps() {
         let mut state = state.borrow_mut();
         let Some(editor) = state.as_mut() else { return };
         unsafe {
-            let _ = SendMessageW(editor.list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
-            for app in &apps {
-                let wide: Vec<u16> = app.display_name.encode_utf16().chain(Some(0)).collect();
+            let _ = SendMessageW(editor.list, LVM_DELETEALLITEMS, WPARAM(0), LPARAM(0));
+            let (new_image_list, image_indices) = create_app_image_list(&apps);
+            let image_handle = new_image_list.map_or(0, |images| images.0);
+            let _ = SendMessageW(
+                editor.list,
+                LVM_SETIMAGELIST,
+                WPARAM(LVSIL_SMALL as usize),
+                LPARAM(image_handle),
+            );
+            let old_image_list = editor.image_list.take();
+            editor.image_list = new_image_list;
+            if let Some(old_image_list) = old_image_list {
+                let _ = ImageList_Destroy(old_image_list);
+            }
+
+            for (index, app) in apps.iter().enumerate() {
+                let mut wide: Vec<u16> = app.display_name.encode_utf16().chain(Some(0)).collect();
+                let item = LVITEMW {
+                    mask: LVIF_TEXT | LVIF_IMAGE,
+                    iItem: index as i32,
+                    iSubItem: 0,
+                    pszText: PWSTR(wide.as_mut_ptr()),
+                    iImage: image_indices.get(index).copied().unwrap_or(-1),
+                    ..Default::default()
+                };
                 let _ = SendMessageW(
                     editor.list,
-                    LB_ADDSTRING,
+                    LVM_INSERTITEMW,
                     WPARAM(0),
-                    LPARAM(wide.as_ptr() as isize),
+                    LPARAM((&item as *const LVITEMW) as isize),
                 );
             }
         }
@@ -778,7 +829,13 @@ fn save_selected_app_rule() {
         let state = state.borrow();
         let editor = state.as_ref()?;
         unsafe {
-            let app_index = SendMessageW(editor.list, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
+            let app_index = SendMessageW(
+                editor.list,
+                LVM_GETNEXTITEM,
+                WPARAM(usize::MAX),
+                LPARAM(LVNI_SELECTED as isize),
+            )
+            .0;
             if app_index < 0 {
                 return None;
             }
@@ -848,34 +905,28 @@ unsafe extern "system" fn collect_running_app(hwnd: HWND, lparam: LPARAM) -> BOO
     if process_id == 0 || process_id == GetCurrentProcessId() {
         return TRUE;
     }
-    let Some(exe_name) = process_name_from_id(process_id) else {
+    let Some((exe_name, exe_path)) = process_info_from_id(process_id) else {
         return TRUE;
     };
-    let mut title = vec![0u16; title_len as usize + 1];
-    let copied = GetWindowTextW(hwnd, &mut title);
-    if copied <= 0 {
-        return TRUE;
-    }
-    let title = compact_window_title(&String::from_utf16_lossy(&title[..copied as usize]), 24);
     let apps = &mut *(lparam.0 as *mut Vec<RunningApp>);
     apps.push(RunningApp {
-        display_name: format!("{}   ·   {}", exe_name, title),
+        display_name: process_display_name(&exe_name),
         exe_name,
+        exe_path,
     });
     TRUE
 }
 
-fn compact_window_title(title: &str, max_chars: usize) -> String {
-    let compact = title.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.chars().count() <= max_chars {
-        return compact;
-    }
-    let mut shortened: String = compact.chars().take(max_chars.saturating_sub(1)).collect();
-    shortened.push('…');
-    shortened
+fn process_display_name(exe_name: &str) -> String {
+    Path::new(exe_name)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(exe_name)
+        .to_string()
 }
 
-fn process_name_from_id(process_id: u32) -> Option<String> {
+fn process_info_from_id(process_id: u32) -> Option<(String, PathBuf)> {
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id).ok()?;
         let mut buffer = [0u16; 1024];
@@ -888,9 +939,42 @@ fn process_name_from_id(process_id: u32) -> Option<String> {
         );
         let _ = CloseHandle(process);
         result.ok()?;
-        let path = String::from_utf16_lossy(&buffer[..len as usize]);
-        Path::new(&path).file_name()?.to_str().map(str::to_string)
+        let path = PathBuf::from(String::from_utf16_lossy(&buffer[..len as usize]));
+        let exe_name = path.file_name()?.to_str()?.to_string();
+        Some((exe_name, path))
     }
+}
+
+unsafe fn create_app_image_list(apps: &[RunningApp]) -> (Option<HIMAGELIST>, Vec<i32>) {
+    let images = ImageList_Create(20, 20, ILC_COLOR32 | ILC_MASK, apps.len().max(1) as i32, 4);
+    if images.0 == 0 {
+        return (None, vec![-1; apps.len()]);
+    }
+
+    let mut image_indices = Vec::with_capacity(apps.len());
+    for app in apps {
+        let path: Vec<u16> = app
+            .exe_path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let mut file_info = SHFILEINFOW::default();
+        let loaded = SHGetFileInfoW(
+            PCWSTR(path.as_ptr()),
+            Default::default(),
+            Some(&mut file_info),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_ICON | SHGFI_SMALLICON,
+        );
+        if loaded != 0 && !file_info.hIcon.0.is_null() {
+            image_indices.push(ImageList_ReplaceIcon(images, -1, file_info.hIcon));
+            let _ = DestroyIcon(file_info.hIcon);
+        } else {
+            image_indices.push(-1);
+        }
+    }
+    (Some(images), image_indices)
 }
 
 fn open_config() {
@@ -952,18 +1036,16 @@ fn restart_app() {
 
 #[cfg(test)]
 mod tests {
-    use super::compact_window_title;
+    use super::process_display_name;
 
     #[test]
-    fn long_browser_titles_are_compacted_for_the_application_list() {
-        let title = "这是一个内容非常长的浏览器页面标题，用来验证应用规则窗口不会被一整行网页标题撑满并影响阅读";
-        let compact = compact_window_title(title, 24);
-        assert_eq!(compact.chars().count(), 24);
-        assert!(compact.ends_with('…'));
+    fn application_list_uses_only_the_executable_name() {
+        assert_eq!(process_display_name("Photoshop.exe"), "Photoshop");
+        assert_eq!(process_display_name("Tabbit Browser.exe"), "Tabbit Browser");
     }
 
     #[test]
-    fn short_titles_are_kept_unchanged() {
-        assert_eq!(compact_window_title("微信", 24), "微信");
+    fn extensionless_process_names_are_kept() {
+        assert_eq!(process_display_name("微信"), "微信");
     }
 }

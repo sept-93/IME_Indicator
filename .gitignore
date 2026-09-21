@@ -1,6 +1,8 @@
 # Rust
 rust_indicator/target/
 rust_indicator/config.toml
+/backups/
+/dist/
 
 # Python
 **/__pycache__/
