@@ -1,16 +1,17 @@
 //! 文本光标位置检测模块 - 多级检测策略
 
-
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use windows::core::{Interface, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HWND, POINT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
-use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
+};
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Accessibility::CUIAutomation;
 use windows::Win32::UI::Accessibility::IUIAutomation;
@@ -18,7 +19,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_F2, VK_LBUTTON, VK_RETURN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
+    GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
 };
 
 // ============================================================================
@@ -40,6 +41,9 @@ const CARET_FAST_PATH_APPS: &[&str] = &[
     "Photoshop.exe",
     "Illustrator.exe",
     "Cinema 4D.exe",
+    "SearchHost.exe",
+    "SearchApp.exe",
+    "StartMenuExperienceHost.exe",
 ];
 
 /// 浏览器和富文本应用常把真正的编辑区暴露为 Custom/Text/Group，而不是标准 Edit。
@@ -116,6 +120,7 @@ pub struct CaretDetector {
     f2_down: bool,
     left_down: bool,
     v_down: bool,
+    last_left_click: Option<(Instant, u32, i32, i32)>,
 }
 
 impl CaretDetector {
@@ -142,6 +147,7 @@ impl CaretDetector {
             f2_down: false,
             left_down: false,
             v_down: false,
+            last_left_click: None,
         }
     }
 
@@ -169,18 +175,12 @@ impl CaretDetector {
                 foreground_hwnd
             };
 
-            let fallback_identity = format!(
-                "{}:{}",
-                foreground_hwnd.0 as usize,
-                focused_hwnd.0 as usize
-            );
+            let fallback_identity =
+                format!("{}:{}", foreground_hwnd.0 as usize, focused_hwnd.0 as usize);
 
             let process_name = process_name(process_id).unwrap_or_default();
-            let design_text_mode = self.update_design_text_mode(
-                &process_name,
-                process_id,
-                has_caret,
-            );
+            let design_text_mode =
+                self.update_design_text_mode(&process_name, process_id, has_caret);
 
             // 微信等自绘应用的 UIA GetFocusedElement 会卡住约 3 秒，并且最终只返回
             // 顶层窗口。Win32/MSAA Caret 已能可靠反映聊天框和搜索框是否可输入。
@@ -224,10 +224,12 @@ impl CaretDetector {
 
             let control_type = focused.CurrentControlType().unwrap_or_default();
             let password = focused.CurrentIsPassword().map_or(false, |v| v.as_bool());
-            let value_pattern = focused.GetCurrentPattern(UIA_ValuePatternId)
+            let value_pattern = focused
+                .GetCurrentPattern(UIA_ValuePatternId)
                 .ok()
                 .and_then(|p| p.cast::<IUIAutomationValuePattern>().ok());
-            let value_is_readonly = value_pattern.as_ref()
+            let value_is_readonly = value_pattern
+                .as_ref()
                 .and_then(|vp| vp.CurrentIsReadOnly().ok())
                 .map(|v| v.as_bool());
             let caret_compat = process_matches(&process_name, CARET_COMPAT_APPS)
@@ -256,13 +258,11 @@ impl CaretDetector {
             let identity = if let Some(runtime_id) = uia_runtime_id(&focused) {
                 format!(
                     "{}:{}:{}:{:?}",
-                    foreground_hwnd.0 as usize,
-                    native_hwnd.0 as usize,
-                    control_type.0,
-                    runtime_id,
+                    foreground_hwnd.0 as usize, native_hwnd.0 as usize, control_type.0, runtime_id,
                 )
             } else {
-                let automation_id = focused.CurrentAutomationId()
+                let automation_id = focused
+                    .CurrentAutomationId()
                     .map(|s| s.to_string())
                     .unwrap_or_default();
                 let bounds = focused.CurrentBoundingRectangle().unwrap_or_default();
@@ -321,6 +321,24 @@ impl CaretDetector {
         self.left_down = left_now;
         self.v_down = v_now;
 
+        let double_clicked = if left_pressed {
+            let mut point = POINT::default();
+            let has_point = unsafe { GetCursorPos(&mut point).is_ok() };
+            let is_double = has_point
+                && self.last_left_click.is_some_and(|(when, pid, x, y)| {
+                    pid == process_id
+                        && when.elapsed() <= Duration::from_millis(550)
+                        && (point.x - x).abs() <= 8
+                        && (point.y - y).abs() <= 8
+                });
+            if has_point {
+                self.last_left_click = Some((Instant::now(), process_id, point.x, point.y));
+            }
+            is_double
+        } else {
+            false
+        };
+
         if process_id == 0 {
             return false;
         }
@@ -336,6 +354,11 @@ impl CaretDetector {
             } else if t_pressed && !has_caret {
                 // T 只选择文字工具；等用户真正点击画布文字位置后才进入中文。
                 self.design_text_tools.insert(process_id);
+            } else if double_clicked && !crate::cursor_detector::is_standard_arrow_cursor() {
+                // 使用移动/选择工具双击已有文字时，Photoshop/Illustrator 不会创建
+                // Windows Caret。把非标准设计光标下的双击视为进入已有文字编辑。
+                self.design_text_tools.insert(process_id);
+                self.design_text_processes.insert(process_id);
             } else if self.design_text_tools.contains(&process_id) && left_pressed {
                 if crate::cursor_detector::is_standard_arrow_cursor() {
                     // 点击图层、工具栏等普通界面立即离开输入态，保证快捷键使用英文。
@@ -353,6 +376,12 @@ impl CaretDetector {
         if process_matches(process_name, DESIGN_RENAME_SHORTCUT_APPS) {
             let was_active = self.design_text_processes.contains(&process_id);
             if escape_pressed || (was_active && enter_pressed) {
+                self.design_text_processes.remove(&process_id);
+            } else if was_active
+                && left_pressed
+                && crate::cursor_detector::is_standard_arrow_cursor()
+            {
+                // 点击回主界面后退出重命名输入态，恢复英文快捷键环境。
                 self.design_text_processes.remove(&process_id);
             } else if !has_caret
                 && (f2_pressed
@@ -377,7 +406,9 @@ impl CaretDetector {
     /// 多级检测：按配置的 methods 顺序依次尝试
     fn detect(&mut self) -> Option<CaretPos> {
         for name in crate::config::caret_methods() {
-            let Some(method) = DetectionSource::from_name(name) else { continue };
+            let Some(method) = DetectionSource::from_name(name) else {
+                continue;
+            };
             let pos = match method {
                 DetectionSource::GuiInfo => self.get_pos_via_gui_info(),
                 DetectionSource::MsaaCaret => self.get_pos_via_msaa_caret(),
@@ -423,9 +454,9 @@ impl CaretDetector {
 
     /// 通过 MSAA OBJID_CARET 获取光标位置（VS Code 支持，浏览器不提供此对象）
     fn get_pos_via_msaa_caret(&mut self) -> Option<CaretPos> {
-        use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
         use windows::core::GUID;
         use windows::core::VARIANT;
+        use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
 
         // 追加错误信息
         let append_error = |s: &mut String, new: &str| {
@@ -455,7 +486,10 @@ impl CaretDetector {
             );
 
             if result.is_err() {
-                append_error(&mut self.last_uia_error, &format!("MSAA:Err:{:X}", result.unwrap_err().code().0 as u32));
+                append_error(
+                    &mut self.last_uia_error,
+                    &format!("MSAA:Err:{:X}", result.unwrap_err().code().0 as u32),
+                );
                 return None;
             } else if p_acc.is_none() {
                 append_error(&mut self.last_uia_error, "MSAA:NoAcc");
@@ -484,7 +518,10 @@ impl CaretDetector {
                     }
                 }
                 Err(e) => {
-                    append_error(&mut self.last_uia_error, &format!("MSAA:Loc:{:X}", e.code().0 as u32));
+                    append_error(
+                        &mut self.last_uia_error,
+                        &format!("MSAA:Loc:{:X}", e.code().0 as u32),
+                    );
                     None
                 }
             }
@@ -530,8 +567,8 @@ fn process_name(process_id: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        process_matches, CARET_COMPAT_APPS, CARET_FAST_PATH_APPS,
-        DESIGN_RENAME_SHORTCUT_APPS, DESIGN_TEXT_SHORTCUT_APPS,
+        process_matches, CARET_COMPAT_APPS, CARET_FAST_PATH_APPS, DESIGN_RENAME_SHORTCUT_APPS,
+        DESIGN_TEXT_SHORTCUT_APPS,
     };
 
     #[test]
@@ -539,6 +576,8 @@ mod tests {
         assert!(process_matches("weixin.exe", CARET_FAST_PATH_APPS));
         assert!(process_matches("WXWork.exe", CARET_FAST_PATH_APPS));
         assert!(process_matches("WeCom.exe", CARET_FAST_PATH_APPS));
+        assert!(process_matches("SearchHost.exe", CARET_FAST_PATH_APPS));
+        assert!(process_matches("SearchApp.exe", CARET_FAST_PATH_APPS));
     }
 
     #[test]
@@ -556,9 +595,15 @@ mod tests {
     #[test]
     fn adobe_canvas_apps_support_text_tool_shortcut() {
         assert!(process_matches("Photoshop.exe", DESIGN_TEXT_SHORTCUT_APPS));
-        assert!(process_matches("Illustrator.exe", DESIGN_TEXT_SHORTCUT_APPS));
+        assert!(process_matches(
+            "Illustrator.exe",
+            DESIGN_TEXT_SHORTCUT_APPS
+        ));
         assert!(!process_matches("Cinema 4D.exe", DESIGN_TEXT_SHORTCUT_APPS));
-        assert!(process_matches("Cinema 4D.exe", DESIGN_RENAME_SHORTCUT_APPS));
+        assert!(process_matches(
+            "Cinema 4D.exe",
+            DESIGN_RENAME_SHORTCUT_APPS
+        ));
         assert!(process_matches("Photoshop.exe", CARET_FAST_PATH_APPS));
         assert!(process_matches("Illustrator.exe", CARET_FAST_PATH_APPS));
         assert!(process_matches("Cinema 4D.exe", CARET_FAST_PATH_APPS));
@@ -567,7 +612,9 @@ mod tests {
 
 /// UIA RuntimeId 是元素在当前桌面会话内的稳定身份；相比控件坐标，它不会因
 /// 同一编辑器滚动或窗口移动而变化。
-fn uia_runtime_id(element: &windows::Win32::UI::Accessibility::IUIAutomationElement) -> Option<Vec<i32>> {
+fn uia_runtime_id(
+    element: &windows::Win32::UI::Accessibility::IUIAutomationElement,
+) -> Option<Vec<i32>> {
     use windows::Win32::System::Ole::{
         SafeArrayAccessData, SafeArrayDestroy, SafeArrayGetLBound, SafeArrayGetUBound,
         SafeArrayUnaccessData,
@@ -601,11 +648,8 @@ fn uia_runtime_id(element: &windows::Win32::UI::Accessibility::IUIAutomationElem
             let _ = SafeArrayDestroy(array);
             return None;
         }
-        let values = std::slice::from_raw_parts(
-            data.cast::<i32>(),
-            (upper - lower + 1) as usize,
-        )
-        .to_vec();
+        let values =
+            std::slice::from_raw_parts(data.cast::<i32>(), (upper - lower + 1) as usize).to_vec();
         let _ = SafeArrayUnaccessData(array);
         let _ = SafeArrayDestroy(array);
         Some(values)
@@ -626,8 +670,8 @@ fn font_height(hwnd: HWND) -> Option<i32> {
         HGDIOBJ, TEXTMETRICW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        SendMessageW, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-        SystemParametersInfoW, WM_GETFONT,
+        SendMessageW, SystemParametersInfoW, NONCLIENTMETRICSW, SPI_GETNONCLIENTMETRICS,
+        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_GETFONT,
     };
 
     unsafe {

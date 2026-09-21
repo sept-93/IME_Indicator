@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -63,7 +64,9 @@ impl Default for Config {
             caret_show_en: true,
             // 实测（2026-09）：gui_info 覆盖记事本，msaa_caret 覆盖 VS Code/Edge
             caret_methods: ["gui_info", "msaa_caret"]
-                .iter().map(|s| s.to_string()).collect(),
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             mouse_enable: true,
             mouse_color_cn: parse_color("#FF7800A0"),
             mouse_color_en: parse_color("#0078FF30"),
@@ -91,7 +94,11 @@ impl ConfigParseExt for str {
             let r = u32::from_str_radix(&clean[0..2], 16).unwrap_or(0);
             let g = u32::from_str_radix(&clean[2..4], 16).unwrap_or(0);
             let b = u32::from_str_radix(&clean[4..6], 16).unwrap_or(0);
-            let a = if clean.len() == 8 { u32::from_str_radix(&clean[6..8], 16).unwrap_or(0xA0) } else { 0xA0 };
+            let a = if clean.len() == 8 {
+                u32::from_str_radix(&clean[6..8], 16).unwrap_or(0xA0)
+            } else {
+                0xA0
+            };
             (a << 24) | (r << 16) | (g << 8) | b
         } else {
             0xA0FF7800
@@ -99,7 +106,9 @@ impl ConfigParseExt for str {
     }
 }
 
-pub fn parse_color(s: &str) -> u32 { s.parse_color() }
+pub fn parse_color(s: &str) -> u32 {
+    s.parse_color()
+}
 
 // ============================================================================
 // 微型 TOML 解析器
@@ -120,25 +129,38 @@ fn load_config() -> Config {
 
         for line in content.lines() {
             let line = line.trim();
-            if line.is_empty() || line.starts_with('#') { continue; }
-            
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
             if line.starts_with('[') && line.ends_with(']') {
-                cur_sec = line[1..line.len()-1].to_lowercase();
+                cur_sec = line[1..line.len() - 1].to_lowercase();
             } else if let Some((k, v)) = line.split_once('=') {
                 let key = k.trim().to_lowercase();
-                // 智能移除行内注释：寻找 " #" (带空格的井号) 
+                // 智能移除行内注释：寻找 " #" (带空格的井号)
                 let val = v.split(" #").next().unwrap().trim().to_string();
-                sections.entry(cur_sec.clone()).or_insert_with(HashMap::new).insert(key, val);
+                sections
+                    .entry(cur_sec.clone())
+                    .or_insert_with(HashMap::new)
+                    .insert(key, val);
             }
         }
 
         // 映射数据 (精简写法)
         let get = |sec: &str, key: &str| sections.get(sec)?.get(key);
-        
-        if let Some(v) = get("poll",  "state_interval_ms") { if let Ok(n) = v.parse() { config.poll_state_interval_ms = n; } }
-        if let Some(v) = get("poll",  "track_interval_ms") { if let Ok(n) = v.parse() { config.poll_track_interval_ms = n; } }
-        
-        if let Some(v) = get("tray", "enable") { 
+
+        if let Some(v) = get("poll", "state_interval_ms") {
+            if let Ok(n) = v.parse() {
+                config.poll_state_interval_ms = n;
+            }
+        }
+        if let Some(v) = get("poll", "track_interval_ms") {
+            if let Ok(n) = v.parse() {
+                config.poll_track_interval_ms = n;
+            }
+        }
+
+        if let Some(v) = get("tray", "enable") {
             match v.as_str() {
                 "true" => config.tray_enable = true,
                 "false" => config.tray_enable = false,
@@ -160,10 +182,13 @@ fn load_config() -> Config {
             config.auto_switch_english_klid = v.trim_matches('"').to_string();
         }
         if let Some(v) = get("auto_switch", "settle_ms") {
-            if let Ok(n) = v.parse() { config.auto_switch_settle_ms = n; }
+            if let Ok(n) = v.parse() {
+                config.auto_switch_settle_ms = n;
+            }
         }
         if let Some(v) = get("auto_switch", "app_rules") {
-            for item in v.trim_matches(|c| c == '[' || c == ']')
+            for item in v
+                .trim_matches(|c| c == '[' || c == ']')
                 .split(',')
                 .map(|s| s.trim().trim_matches('"'))
                 .filter(|s| !s.is_empty())
@@ -171,31 +196,50 @@ fn load_config() -> Config {
                 if let Some((app, rule)) = item.split_once('=') {
                     let rule = rule.trim().to_lowercase();
                     if matches!(rule.as_str(), "auto" | "chinese" | "english" | "ignore") {
-                        config.auto_switch_app_rules.insert(app.trim().to_lowercase(), rule);
+                        config
+                            .auto_switch_app_rules
+                            .insert(app.trim().to_lowercase(), rule);
                     }
                 }
             }
         }
         if let Some(v) = get("auto_switch", "extra_input_apps") {
-            config.auto_switch_extra_input_apps = v.trim_matches(|c| c == '[' || c == ']')
+            config.auto_switch_extra_input_apps = v
+                .trim_matches(|c| c == '[' || c == ']')
                 .split(',')
                 .map(|s| s.trim().trim_matches('"').to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
         }
-        
-        if let Some(v) = get("caret", "enable") { 
+
+        if let Some(v) = get("caret", "enable") {
             match v.as_str() {
                 "true" => config.caret_enable = true,
                 "false" => config.caret_enable = false,
                 _ => {}
             }
         }
-        if let Some(v) = get("caret", "color_cn") { config.caret_color_cn = v.parse_color(); }
-        if let Some(v) = get("caret", "color_en") { config.caret_color_en = v.parse_color(); }
-        if let Some(v) = get("caret", "size")     { if let Ok(n) = v.parse() { config.caret_size = n; } }
-        if let Some(v) = get("caret", "offset_x") { if let Ok(n) = v.parse() { config.caret_offset_x = n; } }
-        if let Some(v) = get("caret", "offset_y") { if let Ok(n) = v.parse() { config.caret_offset_y = n; } }
+        if let Some(v) = get("caret", "color_cn") {
+            config.caret_color_cn = v.parse_color();
+        }
+        if let Some(v) = get("caret", "color_en") {
+            config.caret_color_en = v.parse_color();
+        }
+        if let Some(v) = get("caret", "size") {
+            if let Ok(n) = v.parse() {
+                config.caret_size = n;
+            }
+        }
+        if let Some(v) = get("caret", "offset_x") {
+            if let Ok(n) = v.parse() {
+                config.caret_offset_x = n;
+            }
+        }
+        if let Some(v) = get("caret", "offset_y") {
+            if let Ok(n) = v.parse() {
+                config.caret_offset_y = n;
+            }
+        }
         if let Some(v) = get("caret", "show_en") {
             match v.as_str() {
                 "true" => config.caret_show_en = true,
@@ -204,25 +248,46 @@ fn load_config() -> Config {
             }
         }
         if let Some(v) = get("caret", "methods") {
-            let list: Vec<String> = v.trim_matches(|c| c == '[' || c == ']')
-                .split(',').map(|s| s.trim().trim_matches('"').to_lowercase())
-                .filter(|s| !s.is_empty()).collect();
-            if !list.is_empty() { config.caret_methods = list; }
+            let list: Vec<String> = v
+                .trim_matches(|c| c == '[' || c == ']')
+                .split(',')
+                .map(|s| s.trim().trim_matches('"').to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !list.is_empty() {
+                config.caret_methods = list;
+            }
         }
 
-        if let Some(v) = get("mouse", "enable") { 
+        if let Some(v) = get("mouse", "enable") {
             match v.as_str() {
                 "true" => config.mouse_enable = true,
                 "false" => config.mouse_enable = false,
                 _ => {}
             }
         }
-        if let Some(v) = get("mouse", "color_cn") { config.mouse_color_cn = v.parse_color(); }
-        if let Some(v) = get("mouse", "color_en") { config.mouse_color_en = v.parse_color(); }
-        if let Some(v) = get("mouse", "size")     { if let Ok(n) = v.parse() { config.mouse_size = n; } }
-        if let Some(v) = get("mouse", "offset_x") { if let Ok(n) = v.parse() { config.mouse_offset_x = n; } }
-        if let Some(v) = get("mouse", "offset_y") { if let Ok(n) = v.parse() { config.mouse_offset_y = n; } }
-        if let Some(v) = get("mouse", "show_en") { 
+        if let Some(v) = get("mouse", "color_cn") {
+            config.mouse_color_cn = v.parse_color();
+        }
+        if let Some(v) = get("mouse", "color_en") {
+            config.mouse_color_en = v.parse_color();
+        }
+        if let Some(v) = get("mouse", "size") {
+            if let Ok(n) = v.parse() {
+                config.mouse_size = n;
+            }
+        }
+        if let Some(v) = get("mouse", "offset_x") {
+            if let Ok(n) = v.parse() {
+                config.mouse_offset_x = n;
+            }
+        }
+        if let Some(v) = get("mouse", "offset_y") {
+            if let Ok(n) = v.parse() {
+                config.mouse_offset_y = n;
+            }
+        }
+        if let Some(v) = get("mouse", "show_en") {
             match v.as_str() {
                 "true" => config.mouse_show_en = true,
                 "false" => config.mouse_show_en = false,
@@ -230,15 +295,135 @@ fn load_config() -> Config {
             }
         }
         if let Some(v) = get("mouse", "target_cursors") {
-            config.mouse_target_cursors = v.trim_matches(|c| c == '[' || c == ']')
-                .split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            config.mouse_target_cursors = v
+                .trim_matches(|c| c == '[' || c == ']')
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
         }
     }
     config
 }
 
 pub(crate) fn get_config_path() -> PathBuf {
-    std::env::current_exe().unwrap().parent().unwrap().join("config.toml")
+    std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("config.toml")
+}
+
+/// 更新应用规则编辑器所使用的两个配置项。mode 可为 auto/chinese/english/ignore/remove。
+/// 当前进程仍使用启动时载入的配置；保存后由设置窗口提示用户重启。
+pub(crate) fn update_application_setting(process_name: &str, mode: &str) -> io::Result<()> {
+    let process_name = process_name.trim();
+    if process_name.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "应用名称为空"));
+    }
+
+    let path = get_config_path();
+    let mut current = load_config();
+    current
+        .auto_switch_app_rules
+        .remove(&process_name.to_lowercase());
+    current
+        .auto_switch_extra_input_apps
+        .retain(|item| !item.eq_ignore_ascii_case(process_name));
+
+    match mode {
+        "auto" => current
+            .auto_switch_extra_input_apps
+            .push(process_name.to_string()),
+        "chinese" | "english" | "ignore" => {
+            current
+                .auto_switch_app_rules
+                .insert(process_name.to_lowercase(), mode.to_string());
+        }
+        "remove" => {}
+        _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "未知应用规则")),
+    }
+
+    current
+        .auto_switch_extra_input_apps
+        .sort_by_key(|name| name.to_lowercase());
+    let mut rules: Vec<String> = current
+        .auto_switch_app_rules
+        .iter()
+        .map(|(app, rule)| format!("{}={}", app, rule))
+        .collect();
+    rules.sort_by_key(|item| item.to_lowercase());
+
+    let content = fs::read_to_string(&path).unwrap_or_else(|_| generate_toml_template());
+    let content = replace_section_value(
+        &content,
+        "auto_switch",
+        "app_rules",
+        &format_toml_list(&rules),
+    );
+    let content = replace_section_value(
+        &content,
+        "auto_switch",
+        "extra_input_apps",
+        &format_toml_list(&current.auto_switch_extra_input_apps),
+    );
+    fs::write(path, content)
+}
+
+fn format_toml_list(items: &[String]) -> String {
+    let values = items
+        .iter()
+        .map(|item| format!("\"{}\"", item.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{}]", values)
+}
+
+fn replace_section_value(content: &str, section: &str, key: &str, value: &str) -> String {
+    let section_header = format!("[{}]", section);
+    let replacement = format!("{} = {}", key, value);
+    let mut output = Vec::new();
+    let mut in_section = false;
+    let mut found_section = false;
+    let mut wrote_value = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_section && !wrote_value {
+                output.push(replacement.clone());
+            }
+            in_section = trimmed.eq_ignore_ascii_case(&section_header);
+            if in_section {
+                found_section = true;
+            }
+            output.push(line.to_string());
+            continue;
+        }
+        if in_section {
+            if let Some((candidate, _)) = trimmed.split_once('=') {
+                if candidate.trim().eq_ignore_ascii_case(key) {
+                    // 旧配置可能因手动添加留下重复键；只保留一个规范值，避免
+                    // 后面的空列表覆盖用户刚保存的规则。
+                    if !wrote_value {
+                        output.push(replacement.clone());
+                        wrote_value = true;
+                    }
+                    continue;
+                }
+            }
+        }
+        output.push(line.to_string());
+    }
+
+    if in_section {
+        if !wrote_value {
+            output.push(replacement);
+        }
+    } else if !found_section {
+        output.push(section_header);
+        output.push(replacement);
+    }
+    output.join("\r\n") + "\r\n"
 }
 
 fn generate_toml_template() -> String {
@@ -283,7 +468,8 @@ offset_x = 2
 offset_y = 18
 show_en = true              # 英文状态下是否显示
 target_cursors = [32513]         # 仅 I-Beam；普通箭头会在非输入区造成误提示
-"##.to_string()
+"##
+    .to_string()
 }
 
 // ============================================================================
@@ -291,34 +477,114 @@ target_cursors = [32513]         # 仅 I-Beam；普通箭头会在非输入区�
 // ============================================================================
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
-pub fn get() -> &'static Config { CONFIG.get_or_init(load_config) }
+pub fn get() -> &'static Config {
+    CONFIG.get_or_init(load_config)
+}
 
-pub fn state_poll_interval_ms() -> u64 { get().poll_state_interval_ms }
-pub fn track_poll_interval_ms() -> u64 { get().poll_track_interval_ms }
-pub fn tray_enable() -> bool { get().tray_enable }
-pub fn auto_switch_enable() -> bool { get().auto_switch_enable }
-pub fn auto_switch_chinese_klid() -> &'static str { &get().auto_switch_chinese_klid }
-pub fn auto_switch_english_klid() -> &'static str { &get().auto_switch_english_klid }
-pub fn auto_switch_settle_ms() -> u64 { get().auto_switch_settle_ms }
+pub fn state_poll_interval_ms() -> u64 {
+    get().poll_state_interval_ms
+}
+pub fn track_poll_interval_ms() -> u64 {
+    get().poll_track_interval_ms
+}
+pub fn tray_enable() -> bool {
+    get().tray_enable
+}
+pub fn auto_switch_enable() -> bool {
+    get().auto_switch_enable
+}
+pub fn auto_switch_chinese_klid() -> &'static str {
+    &get().auto_switch_chinese_klid
+}
+pub fn auto_switch_english_klid() -> &'static str {
+    &get().auto_switch_english_klid
+}
+pub fn auto_switch_settle_ms() -> u64 {
+    get().auto_switch_settle_ms
+}
 pub fn auto_switch_app_rule(process_name: &str) -> Option<&'static str> {
-    get().auto_switch_app_rules.get(&process_name.to_lowercase()).map(String::as_str)
+    get()
+        .auto_switch_app_rules
+        .get(&process_name.to_lowercase())
+        .map(String::as_str)
 }
 pub fn auto_switch_extra_input_apps() -> &'static [String] {
     &get().auto_switch_extra_input_apps
 }
-pub fn caret_enable() -> bool { get().caret_enable }
-pub fn caret_color_cn() -> u32 { get().caret_color_cn }
-pub fn caret_color_en() -> u32 { get().caret_color_en }
-pub fn caret_size() -> i32 { get().caret_size }
-pub fn caret_offset_x() -> i32 { get().caret_offset_x }
-pub fn caret_offset_y() -> i32 { get().caret_offset_y }
-pub fn caret_show_en() -> bool { get().caret_show_en }
-pub fn caret_methods() -> &'static [String] { &get().caret_methods }
-pub fn mouse_enable() -> bool { get().mouse_enable }
-pub fn mouse_color_cn() -> u32 { get().mouse_color_cn }
-pub fn mouse_color_en() -> u32 { get().mouse_color_en }
-pub fn mouse_size() -> i32 { get().mouse_size }
-pub fn mouse_offset_x() -> i32 { get().mouse_offset_x }
-pub fn mouse_offset_y() -> i32 { get().mouse_offset_y }
-pub fn mouse_show_en() -> bool { get().mouse_show_en }
-pub fn mouse_target_cursors() -> &'static [u32] { &get().mouse_target_cursors }
+pub fn caret_enable() -> bool {
+    get().caret_enable
+}
+pub fn caret_color_cn() -> u32 {
+    get().caret_color_cn
+}
+pub fn caret_color_en() -> u32 {
+    get().caret_color_en
+}
+pub fn caret_size() -> i32 {
+    get().caret_size
+}
+pub fn caret_offset_x() -> i32 {
+    get().caret_offset_x
+}
+pub fn caret_offset_y() -> i32 {
+    get().caret_offset_y
+}
+pub fn caret_show_en() -> bool {
+    get().caret_show_en
+}
+pub fn caret_methods() -> &'static [String] {
+    &get().caret_methods
+}
+pub fn mouse_enable() -> bool {
+    get().mouse_enable
+}
+pub fn mouse_color_cn() -> u32 {
+    get().mouse_color_cn
+}
+pub fn mouse_color_en() -> u32 {
+    get().mouse_color_en
+}
+pub fn mouse_size() -> i32 {
+    get().mouse_size
+}
+pub fn mouse_offset_x() -> i32 {
+    get().mouse_offset_x
+}
+pub fn mouse_offset_y() -> i32 {
+    get().mouse_offset_y
+}
+pub fn mouse_show_en() -> bool {
+    get().mouse_show_en
+}
+pub fn mouse_target_cursors() -> &'static [u32] {
+    &get().mouse_target_cursors
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_toml_list, replace_section_value};
+
+    #[test]
+    fn rule_editor_replaces_only_the_requested_auto_switch_value() {
+        let input = "[auto_switch]\napp_rules = []\napp_rules = [\"old.exe=ignore\"]\nextra_input_apps = []\n\n[caret]\nenable = true\n";
+        let output = replace_section_value(
+            input,
+            "auto_switch",
+            "app_rules",
+            "[\"photoshop.exe=chinese\"]",
+        );
+        assert!(output.contains("app_rules = [\"photoshop.exe=chinese\"]"));
+        assert_eq!(output.matches("app_rules =").count(), 1);
+        assert!(output.contains("extra_input_apps = []"));
+        assert!(output.contains("[caret]\r\nenable = true"));
+    }
+
+    #[test]
+    fn rule_editor_formats_application_names_as_toml_strings() {
+        let values = vec!["Example App.exe".to_string(), "Editor.exe".to_string()];
+        assert_eq!(
+            format_toml_list(&values),
+            "[\"Example App.exe\", \"Editor.exe\"]"
+        );
+    }
+}

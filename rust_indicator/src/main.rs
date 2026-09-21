@@ -1,11 +1,12 @@
 #![windows_subsystem = "windows"]
 
-mod caret_detector;
 mod auto_switch;
+mod caret_detector;
 mod config;
 mod cursor_detector;
 mod ime_detector;
 mod overlay;
+mod single_instance;
 mod tray;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,17 +16,21 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::POINT;
 use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, LoadIconW, IDI_APPLICATION};
 
-use caret_detector::CaretDetector;
 use auto_switch::AutoSwitcher;
+use caret_detector::CaretDetector;
 use cursor_detector::CursorDetector;
 use ime_detector::is_chinese_mode;
 use overlay::IndicatorOverlay;
 use tray::TrayManager;
 
 fn main() {
+    if !single_instance::acquire() {
+        return;
+    }
+
     // 初始化 GDI+ (IndicatorOverlay 内部会处理，但这里为了可能需要的图标加载，我们显示初始化)
     // 实际上 IndicatorOverlay::new 内部会调用 GdiplusStartup
-    
+
     // 配置高 DPI 感知
     set_dpi_awareness();
     tray::initialize_smart_switch(config::auto_switch_enable());
@@ -47,16 +52,19 @@ fn main() {
             GdiplusVersion: 1,
             ..Default::default()
         };
-        let _ = windows::Win32::Graphics::GdiPlus::GdiplusStartup(&mut token, &input, std::ptr::null_mut());
+        let _ = windows::Win32::Graphics::GdiPlus::GdiplusStartup(
+            &mut token,
+            &input,
+            std::ptr::null_mut(),
+        );
 
         if config::tray_enable() {
             // 尝试加载图标
             let h_instance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap();
             // 这里的 1 对应 resource.rc 中的 ID
-            let mut icon = LoadIconW(h_instance, windows::core::PCWSTR(1 as _)).unwrap_or_else(|_| {
-                LoadIconW(None, IDI_APPLICATION).unwrap()
-            });
-            
+            let mut icon = LoadIconW(h_instance, windows::core::PCWSTR(1 as _))
+                .unwrap_or_else(|_| LoadIconW(None, IDI_APPLICATION).unwrap());
+
             // 1. 尝试从可执行文件同目录加载外部 icon.png (允许用户自定义)
             let mut loaded = false;
             if let Ok(exe_path) = std::env::current_exe() {
@@ -76,10 +84,10 @@ fn main() {
             }
 
             let tray = TrayManager::new(icon);
-            
+
             // 这将阻塞直到用户退出（主窗口收到 WM_QUIT）
             tray.run_message_loop();
-            
+
             // 退出后清理
             running.store(false, Ordering::SeqCst);
             tray.destroy();
@@ -90,7 +98,7 @@ fn main() {
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
-        
+
         windows::Win32::Graphics::GdiPlus::GdiplusShutdown(token);
     }
 }
@@ -234,9 +242,8 @@ fn run_detector_loop(running: Arc<AtomicBool>) {
 fn set_dpi_awareness() {
     unsafe {
         // 尝试使用 SetProcessDpiAwareness (Windows 8.1+)
-        let shcore = windows::Win32::System::LibraryLoader::LoadLibraryW(
-            windows::core::w!("shcore.dll"),
-        );
+        let shcore =
+            windows::Win32::System::LibraryLoader::LoadLibraryW(windows::core::w!("shcore.dll"));
         if let Ok(h) = shcore {
             if let Some(func) = windows::Win32::System::LibraryLoader::GetProcAddress(
                 h,
@@ -248,9 +255,8 @@ fn set_dpi_awareness() {
             }
         }
         // 回退到 SetProcessDPIAware (使用动态加载)
-        let user32 = windows::Win32::System::LibraryLoader::LoadLibraryW(
-            windows::core::w!("user32.dll"),
-        );
+        let user32 =
+            windows::Win32::System::LibraryLoader::LoadLibraryW(windows::core::w!("user32.dll"));
         if let Ok(h) = user32 {
             if let Some(func) = windows::Win32::System::LibraryLoader::GetProcAddress(
                 h,

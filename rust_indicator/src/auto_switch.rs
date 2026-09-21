@@ -7,8 +7,7 @@ use std::time::{Duration, Instant};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
 use windows::Win32::UI::Input::KeyboardAndMouse::{LoadKeyboardLayoutW, KLF_ACTIVATE};
@@ -88,13 +87,20 @@ impl AutoSwitcher {
             self.candidate_since = Instant::now();
             // 输入框和搜索框优先响应：一旦检测到 Caret/Edit/Document 焦点，
             // 本轮立即切换。非输入区仍保留短暂防抖，避免切窗口时闪动。
-            if !self.candidate.as_ref().is_some_and(|candidate| candidate.editable) {
+            if !self
+                .candidate
+                .as_ref()
+                .is_some_and(|candidate| candidate.editable)
+            {
                 return;
             }
         }
 
         let settle = Duration::from_millis(crate::config::auto_switch_settle_ms());
-        if self.candidate.as_ref().is_some_and(|candidate| !candidate.editable)
+        if self
+            .candidate
+            .as_ref()
+            .is_some_and(|candidate| !candidate.editable)
             && self.candidate_since.elapsed() < settle
         {
             return;
@@ -112,21 +118,12 @@ impl AutoSwitcher {
         self.applied_context = Some(context_key);
 
         let process_name = process_name(context.process_id).unwrap_or_default();
-        let rule = crate::config::auto_switch_app_rule(&process_name)
-            .unwrap_or_else(|| default_rule_for_process(&process_name));
-        let Some(target) = target_for(rule, context.password, context.editable) else { return };
+        let rule = crate::config::auto_switch_app_rule(&process_name).unwrap_or("auto");
+        let Some(target) = target_for(rule, context.password, context.editable) else {
+            return;
+        };
 
         let _ = switch_language(context.focused_hwnd, context.foreground_hwnd, target);
-    }
-}
-
-fn default_rule_for_process(process_name: &str) -> &'static str {
-    // Cinema 4D 的输入控件和主界面共用自绘消息循环，自动发送语言切换请求
-    // 容易造成卡顿。默认只显示状态；用户仍可用 app_rules 显式覆盖。
-    if process_name.eq_ignore_ascii_case("Cinema 4D.exe") {
-        "ignore"
-    } else {
-        "auto"
     }
 }
 
@@ -158,11 +155,18 @@ fn process_name(process_id: u32) -> Option<String> {
         let _ = CloseHandle(process);
         result.ok()?;
         let full_path = String::from_utf16_lossy(&buffer[..len as usize]);
-        Path::new(&full_path).file_name()?.to_str().map(str::to_string)
+        Path::new(&full_path)
+            .file_name()?
+            .to_str()
+            .map(str::to_string)
     }
 }
 
-fn switch_language(focused_hwnd: HWND, foreground_hwnd: HWND, target: LanguageTarget) -> windows::core::Result<()> {
+fn switch_language(
+    focused_hwnd: HWND,
+    foreground_hwnd: HWND,
+    target: LanguageTarget,
+) -> windows::core::Result<()> {
     let klid = match target {
         LanguageTarget::Chinese => crate::config::auto_switch_chinese_klid(),
         LanguageTarget::English => crate::config::auto_switch_english_klid(),
@@ -171,7 +175,11 @@ fn switch_language(focused_hwnd: HWND, foreground_hwnd: HWND, target: LanguageTa
 
     unsafe {
         let layout = LoadKeyboardLayoutW(PCWSTR(wide.as_ptr()), KLF_ACTIVATE)?;
-        let target_hwnd = if !focused_hwnd.0.is_null() { focused_hwnd } else { foreground_hwnd };
+        let target_hwnd = if !focused_hwnd.0.is_null() {
+            focused_hwnd
+        } else {
+            foreground_hwnd
+        };
         let mut result = 0usize;
         let sent = SendMessageTimeoutW(
             target_hwnd,
@@ -216,7 +224,7 @@ fn send_ime_control(hwnd: HWND, command: usize, value: isize) {
 mod tests {
     use windows::Win32::Foundation::HWND;
 
-    use super::{default_rule_for_process, target_for, LanguageTarget, SwitchContextKey};
+    use super::{target_for, LanguageTarget, SwitchContextKey};
     use crate::caret_detector::FocusContext;
 
     fn context(editable: bool, password: bool) -> FocusContext {
@@ -234,22 +242,31 @@ mod tests {
 
     #[test]
     fn automatic_rules_follow_context() {
-        assert_eq!(target_for("auto", false, true), Some(LanguageTarget::Chinese));
-        assert_eq!(target_for("auto", false, false), Some(LanguageTarget::English));
-        assert_eq!(target_for("auto", true, true), Some(LanguageTarget::English));
+        assert_eq!(
+            target_for("auto", false, true),
+            Some(LanguageTarget::Chinese)
+        );
+        assert_eq!(
+            target_for("auto", false, false),
+            Some(LanguageTarget::English)
+        );
+        assert_eq!(
+            target_for("auto", true, true),
+            Some(LanguageTarget::English)
+        );
     }
 
     #[test]
     fn application_rules_take_precedence() {
-        assert_eq!(target_for("chinese", true, false), Some(LanguageTarget::Chinese));
-        assert_eq!(target_for("english", false, true), Some(LanguageTarget::English));
+        assert_eq!(
+            target_for("chinese", true, false),
+            Some(LanguageTarget::Chinese)
+        );
+        assert_eq!(
+            target_for("english", false, true),
+            Some(LanguageTarget::English)
+        );
         assert_eq!(target_for("ignore", false, true), None);
-    }
-
-    #[test]
-    fn cinema_4d_is_indicator_only_by_default() {
-        assert_eq!(default_rule_for_process("Cinema 4D.exe"), "ignore");
-        assert_eq!(default_rule_for_process("Photoshop.exe"), "auto");
     }
 
     #[test]
