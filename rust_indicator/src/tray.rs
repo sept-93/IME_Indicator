@@ -1,9 +1,9 @@
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, LRESULT, TRUE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, DeleteObject, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW,
-    DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, HBRUSH, HFONT,
-    OUT_DEFAULT_PRECIS,
+    CreateFontW, DeleteObject, GetSysColorBrush, SetBkMode, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+    COLOR_WINDOW, DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, HBRUSH, HDC,
+    HFONT, OUT_DEFAULT_PRECIS, TRANSPARENT,
 };
 use windows::Win32::Graphics::GdiPlus::{
     GdipCreateBitmapFromFile, GdipCreateHICONFromBitmap, GdipDisposeImage,
@@ -22,22 +22,24 @@ use windows::Win32::UI::Controls::{
     ImageList_Create, ImageList_Destroy, ImageList_ReplaceIcon, InitCommonControlsEx, HIMAGELIST,
     ICC_LISTVIEW_CLASSES, ILC_COLOR32, ILC_MASK, INITCOMMONCONTROLSEX, LVCF_WIDTH, LVCOLUMNW,
     LVIF_IMAGE, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
-    LVM_INSERTITEMW, LVM_SETIMAGELIST, LVNI_SELECTED, LVSIL_SMALL, LVS_NOCOLUMNHEADER, LVS_REPORT,
-    LVS_SHOWSELALWAYS, LVS_SINGLESEL,
+    LVM_INSERTITEMW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST, LVNI_SELECTED, LVSIL_SMALL,
+    LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOCOLUMNHEADER, LVS_REPORT, LVS_SHOWSELALWAYS,
+    LVS_SINGLESEL,
 };
 use windows::Win32::UI::Shell::{
     SHGetFileInfoW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NOTIFYICONDATAW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON,
+    NOTIFYICONDATAW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW,
-    EnumChildWindows, EnumWindows, GetCursorPos, GetMessageW, GetWindowTextLengthW,
-    GetWindowThreadProcessId, IsWindowVisible, PostMessageW, PostQuitMessage, RegisterClassW,
-    SendMessageW, SetForegroundWindow, ShowWindow, TrackPopupMenu, TranslateMessage, BM_GETCHECK,
-    BM_SETCHECK, BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, CW_USEDEFAULT, HICON, HMENU, MSG, SW_SHOW,
-    TPM_BOTTOMALIGN, TPM_LEFTALIGN, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_NULL,
-    WM_RBUTTONUP, WM_SETFONT, WM_USER, WNDCLASSW, WS_CHILD, WS_EX_CLIENTEDGE, WS_GROUP,
-    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    EnumChildWindows, EnumWindows, GetCursorPos, GetMessageW, GetSystemMetrics,
+    GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible, LoadIconW, PostMessageW,
+    PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow, ShowWindow, TrackPopupMenu,
+    TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON,
+    CW_USEDEFAULT, HICON, HMENU, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, TPM_BOTTOMALIGN,
+    TPM_LEFTALIGN, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC,
+    WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_SETFONT, WM_USER, WNDCLASSW, WS_CHILD,
+    WS_EX_CLIENTEDGE, WS_GROUP, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 
 use std::cell::RefCell;
@@ -207,6 +209,10 @@ unsafe extern "system" fn window_proc(
 ) -> LRESULT {
     match msg {
         WM_TRAYICON => match lparam.0 as u32 {
+            WM_LBUTTONUP => {
+                show_app_rule_editor();
+                LRESULT(0)
+            }
             WM_RBUTTONUP => {
                 show_context_menu(hwnd);
                 LRESULT(0)
@@ -494,24 +500,31 @@ fn show_app_rule_editor() {
         };
         let _ = InitCommonControlsEx(&common_controls);
         let class_name = w!("IMEIndicatorAppRulesClass");
+        let window_icon = LoadIconW(h_instance, PCWSTR(1 as _)).unwrap_or_default();
         let window_class = WNDCLASSW {
             lpfnWndProc: Some(app_rule_window_proc),
             hInstance: h_instance.into(),
             lpszClassName: class_name,
             hbrBackground: HBRUSH((COLOR_WINDOW.0 as usize + 1) as *mut _),
+            hIcon: window_icon,
             ..Default::default()
         };
         let _ = RegisterClassW(&window_class);
+
+        const EDITOR_WIDTH: i32 = 350;
+        const EDITOR_HEIGHT: i32 = 555;
+        let editor_x = ((GetSystemMetrics(SM_CXSCREEN) - EDITOR_WIDTH) / 2).max(0);
+        let editor_y = ((GetSystemMetrics(SM_CYSCREEN) - EDITOR_HEIGHT) / 2).max(0);
 
         let Ok(hwnd) = CreateWindowExW(
             Default::default(),
             class_name,
             w!("应用规则 - 输入指示器"),
             WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            410,
-            560,
+            editor_x,
+            editor_y,
+            EDITOR_WIDTH,
+            EDITOR_HEIGHT,
             None,
             None,
             h_instance,
@@ -543,8 +556,8 @@ fn show_app_rule_editor() {
             WS_CHILD | WS_VISIBLE,
             16,
             44,
-            360,
-            22,
+            318,
+            20,
             hwnd,
             None,
             h_instance,
@@ -559,9 +572,9 @@ fn show_app_rule_editor() {
                 | WS_TABSTOP
                 | WINDOW_STYLE(LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOCOLUMNHEADER),
             16,
-            72,
-            362,
-            286,
+            68,
+            318,
+            294,
             hwnd,
             HMENU(IDC_APP_LIST as usize as *mut _),
             h_instance,
@@ -573,7 +586,7 @@ fn show_app_rule_editor() {
         };
         let column = LVCOLUMNW {
             mask: LVCF_WIDTH,
-            cx: 340,
+            cx: 312,
             ..Default::default()
         };
         let _ = SendMessageW(
@@ -582,13 +595,19 @@ fn show_app_rule_editor() {
             WPARAM(0),
             LPARAM((&column as *const LVCOLUMNW) as isize),
         );
+        let _ = SendMessageW(
+            list,
+            LVM_SETEXTENDEDLISTVIEWSTYLE,
+            WPARAM(0),
+            LPARAM((LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER) as isize),
+        );
         let _ = CreateWindowExW(
             Default::default(),
             w!("STATIC"),
             w!("处理方式"),
             WS_CHILD | WS_VISIBLE,
             16,
-            368,
+            370,
             120,
             22,
             hwnd,
@@ -606,11 +625,11 @@ fn show_app_rule_editor() {
             "删除自定义规则",
         ];
         let positions = [
-            (16, 394, 140),
-            (154, 394, 100),
-            (252, 394, 100),
-            (16, 422, 120),
-            (138, 422, 150),
+            (16, 394, 132),
+            (146, 394, 92),
+            (236, 394, 92),
+            (16, 422, 112),
+            (128, 422, 142),
         ];
         for (index, label) in rule_labels.iter().enumerate() {
             let group = if index == 0 {
@@ -655,9 +674,9 @@ fn show_app_rule_editor() {
             w!("BUTTON"),
             w!("刷新列表"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            166,
-            462,
-            100,
+            128,
+            450,
+            96,
             32,
             hwnd,
             HMENU(IDC_REFRESH_APPS as usize as *mut _),
@@ -669,8 +688,8 @@ fn show_app_rule_editor() {
             w!("BUTTON"),
             w!("保存并应用"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
-            276,
-            462,
+            232,
+            450,
             102,
             32,
             hwnd,
@@ -684,9 +703,9 @@ fn show_app_rule_editor() {
             w!("提示：自动识别仅补充输入框检测。"),
             WS_CHILD | WS_VISIBLE,
             16,
-            505,
-            362,
-            22,
+            490,
+            318,
+            18,
             hwnd,
             None,
             h_instance,
@@ -757,6 +776,11 @@ unsafe extern "system" fn app_rule_window_proc(
                 _ => {}
             }
             LRESULT(0)
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+            let hdc = HDC(wparam.0 as *mut _);
+            let _ = SetBkMode(hdc, TRANSPARENT);
+            LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize)
         }
         WM_CLOSE => {
             let _ = DestroyWindow(hwnd);
@@ -946,7 +970,7 @@ fn process_info_from_id(process_id: u32) -> Option<(String, PathBuf)> {
 }
 
 unsafe fn create_app_image_list(apps: &[RunningApp]) -> (Option<HIMAGELIST>, Vec<i32>) {
-    let images = ImageList_Create(20, 20, ILC_COLOR32 | ILC_MASK, apps.len().max(1) as i32, 4);
+    let images = ImageList_Create(28, 28, ILC_COLOR32 | ILC_MASK, apps.len().max(1) as i32, 4);
     if images.0 == 0 {
         return (None, vec![-1; apps.len()]);
     }
@@ -965,7 +989,7 @@ unsafe fn create_app_image_list(apps: &[RunningApp]) -> (Option<HIMAGELIST>, Vec
             Default::default(),
             Some(&mut file_info),
             std::mem::size_of::<SHFILEINFOW>() as u32,
-            SHGFI_ICON | SHGFI_SMALLICON,
+            SHGFI_ICON | SHGFI_LARGEICON,
         );
         if loaded != 0 && !file_info.hIcon.0.is_null() {
             image_indices.push(ImageList_ReplaceIcon(images, -1, file_info.hIcon));

@@ -1,6 +1,6 @@
 //! 文本光标位置检测模块 - 多级检测策略
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -63,11 +63,26 @@ const CARET_COMPAT_APPS: &[&str] = &[
     "wps.exe",
     "et.exe",
     "wpp.exe",
+    "WINWORD.EXE",
+    "EXCEL.EXE",
+    "POWERPNT.EXE",
 ];
 
 /// Photoshop/Illustrator 的画布文字光标完全由应用绘制，Windows 没有 Caret 对象。
 /// 在这些应用内按 T 进入文字工具后进入兼容输入模式，Esc 或 Ctrl+Enter 退出。
 const DESIGN_TEXT_SHORTCUT_APPS: &[&str] = &["Photoshop.exe", "Illustrator.exe"];
+
+/// WPS 与 Microsoft Office 的文档/表格画布经常不公开标准 Edit 控件。
+const OFFICE_EDIT_APPS: &[&str] = &[
+    "wps.exe",
+    "et.exe",
+    "wpp.exe",
+    "WINWORD.EXE",
+    "EXCEL.EXE",
+    "POWERPNT.EXE",
+];
+
+const OFFICE_SPREADSHEET_APPS: &[&str] = &["et.exe", "EXCEL.EXE"];
 
 // ============================================================================
 // 类型定义
@@ -120,7 +135,16 @@ pub struct CaretDetector {
     pub last_uia_error: String,
     design_text_processes: HashSet<u32>,
     design_text_tools: HashSet<u32>,
+    design_native_processes: HashSet<u32>,
+    design_caret_suppressed: HashSet<u32>,
+    office_edit_processes: HashSet<u32>,
+    office_caret_suppressed: HashSet<u32>,
+    design_text_cursor_handles: HashMap<u32, isize>,
+    pending_design_native: Option<(u32, Instant)>,
+    pending_design_tool_check: Option<(u32, Instant)>,
+    pending_office_edit: Option<(u32, Instant)>,
     t_down: bool,
+    b_down: bool,
     escape_down: bool,
     enter_down: bool,
     left_down: bool,
@@ -146,7 +170,16 @@ impl CaretDetector {
             last_uia_error: String::new(),
             design_text_processes: HashSet::new(),
             design_text_tools: HashSet::new(),
+            design_native_processes: HashSet::new(),
+            design_caret_suppressed: HashSet::new(),
+            office_edit_processes: HashSet::new(),
+            office_caret_suppressed: HashSet::new(),
+            design_text_cursor_handles: HashMap::new(),
+            pending_design_native: None,
+            pending_design_tool_check: None,
+            pending_office_edit: None,
             t_down: false,
+            b_down: false,
             escape_down: false,
             enter_down: false,
             left_down: false,
@@ -183,21 +216,26 @@ impl CaretDetector {
                 format!("{}:{}", foreground_hwnd.0 as usize, focused_hwnd.0 as usize);
 
             let process_name = process_name(process_id).unwrap_or_default();
-            let design_text_mode =
-                self.update_design_text_mode(&process_name, process_id, has_caret);
+            let special_edit_mode =
+                self.update_application_edit_mode(&process_name, process_id, has_caret);
 
             // 微信等自绘应用的 UIA GetFocusedElement 会卡住约 3 秒，并且最终只返回
             // 顶层窗口。Win32/MSAA Caret 已能可靠反映聊天框和搜索框是否可输入。
             if process_matches(&process_name, CARET_FAST_PATH_APPS) {
+                let editable = if process_matches(&process_name, DESIGN_TEXT_SHORTCUT_APPS) {
+                    special_edit_mode
+                } else {
+                    has_caret || special_edit_mode
+                };
                 return FocusContext {
                     identity: fallback_identity,
                     foreground_hwnd,
                     focused_hwnd,
                     process_id,
-                    editable: has_caret || design_text_mode,
+                    editable,
                     password: false,
                     readonly_document: false,
-                    force_mouse_indicator: design_text_mode && !has_caret,
+                    force_mouse_indicator: special_edit_mode && !has_caret,
                 };
             }
 
@@ -207,10 +245,10 @@ impl CaretDetector {
                     foreground_hwnd,
                     focused_hwnd,
                     process_id,
-                    editable: has_caret || design_text_mode,
+                    editable: has_caret || special_edit_mode,
                     password: false,
                     readonly_document: false,
-                    force_mouse_indicator: design_text_mode && !has_caret,
+                    force_mouse_indicator: special_edit_mode && !has_caret,
                 };
             };
             let Ok(focused) = automation.GetFocusedElement() else {
@@ -219,10 +257,10 @@ impl CaretDetector {
                     foreground_hwnd,
                     focused_hwnd,
                     process_id,
-                    editable: has_caret || design_text_mode,
+                    editable: has_caret || special_edit_mode,
                     password: false,
                     readonly_document: false,
-                    force_mouse_indicator: design_text_mode && !has_caret,
+                    force_mouse_indicator: special_edit_mode && !has_caret,
                 };
             };
 
@@ -255,7 +293,7 @@ impl CaretDetector {
                 // 使用 Caret 回退。其他应用保持严格模式，防止非输入区的黄色假点。
                 has_caret && caret_compat
             };
-            let editable = standard_editable || design_text_mode;
+            let editable = standard_editable || special_edit_mode;
             let readonly_document = control_type == UIA_DocumentControlTypeId && !editable;
 
             let native_hwnd = focused.CurrentNativeWindowHandle().unwrap_or_default();
@@ -291,18 +329,19 @@ impl CaretDetector {
                 editable,
                 password,
                 readonly_document,
-                force_mouse_indicator: design_text_mode && !has_caret,
+                force_mouse_indicator: special_edit_mode && !has_caret,
             }
         }
     }
 
-    fn update_design_text_mode(
+    fn update_application_edit_mode(
         &mut self,
         process_name: &str,
         process_id: u32,
         has_caret: bool,
     ) -> bool {
         let (t_now, t_since_last) = key_sample(0x54); // T
+        let (b_now, b_since_last) = key_sample(0x42); // B
         let (escape_now, escape_since_last) = key_sample(VK_ESCAPE.0 as i32);
         let (enter_now, enter_since_last) = key_sample(VK_RETURN.0 as i32);
         let (left_now, left_since_last) = key_sample(VK_LBUTTON.0 as i32);
@@ -312,11 +351,13 @@ impl CaretDetector {
         // 同时使用高位按键状态和低位“自上次查询后按过”标志，避免短按 T/Esc
         // 刚好落在两次 30ms 轮询之间，造成 Illustrator 偶发无法进入或退出。
         let t_pressed = t_since_last || (t_now && !self.t_down);
+        let b_pressed = b_since_last || (b_now && !self.b_down);
         let escape_pressed = escape_since_last || (escape_now && !self.escape_down);
         let enter_pressed = enter_since_last || (enter_now && !self.enter_down);
         let left_pressed = left_since_last || (left_now && !self.left_down);
         let v_pressed = v_since_last || (v_now && !self.v_down);
         self.t_down = t_now;
+        self.b_down = b_now;
         self.escape_down = escape_now;
         self.enter_down = enter_now;
         self.left_down = left_now;
@@ -326,61 +367,208 @@ impl CaretDetector {
             return false;
         }
 
+        let mut click_point = POINT::default();
+        let have_click_point = left_pressed && unsafe { GetCursorPos(&mut click_point).is_ok() };
+        let double_click = have_click_point
+            && self
+                .last_left_click
+                .as_ref()
+                .is_some_and(|(at, pid, x, y)| {
+                    *pid == process_id
+                        && at.elapsed() <= Duration::from_millis(500)
+                        && (click_point.x - *x).abs() <= 8
+                        && (click_point.y - *y).abs() <= 8
+                });
+        if left_pressed {
+            self.last_left_click = have_click_point.then_some((
+                Instant::now(),
+                process_id,
+                click_point.x,
+                click_point.y,
+            ));
+        }
+        let standard_arrow = left_pressed && crate::cursor_detector::is_standard_arrow_cursor();
+
         if process_matches(process_name, DESIGN_TEXT_SHORTCUT_APPS) {
+            self.office_edit_processes.clear();
+            self.office_caret_suppressed.clear();
+            self.pending_office_edit = None;
+
             // 切换 Adobe 进程后不沿用另一个窗口/进程的文字工具状态。
             self.design_text_processes.retain(|pid| *pid == process_id);
             self.design_text_tools.retain(|pid| *pid == process_id);
-            let was_active = self.design_text_processes.contains(&process_id);
+            self.design_native_processes
+                .retain(|pid| *pid == process_id);
+            self.design_caret_suppressed
+                .retain(|pid| *pid == process_id);
+            self.design_text_cursor_handles
+                .retain(|pid, _| *pid == process_id);
+
+            if !has_caret {
+                self.design_native_processes.remove(&process_id);
+            }
+            if let Some((pid, started)) = self.pending_design_native {
+                if pid != process_id || started.elapsed() > Duration::from_millis(450) {
+                    self.pending_design_native = None;
+                } else if has_caret {
+                    self.design_caret_suppressed.remove(&process_id);
+                    self.design_native_processes.insert(process_id);
+                    self.pending_design_native = None;
+                }
+            }
+            if let Some((pid, started)) = self.pending_design_tool_check {
+                if pid != process_id {
+                    self.pending_design_tool_check = None;
+                } else if started.elapsed() >= Duration::from_millis(120) {
+                    let expected = self.design_text_cursor_handles.get(&process_id).copied();
+                    let current = crate::cursor_detector::current_cursor_handle();
+                    if expected.is_some() && current.is_some() && expected != current {
+                        self.design_text_processes.remove(&process_id);
+                        self.design_text_tools.remove(&process_id);
+                        self.design_caret_suppressed.insert(process_id);
+                    }
+                    self.pending_design_tool_check = None;
+                }
+            }
+
+            let was_canvas_active = self.design_text_processes.contains(&process_id);
+            let was_native_active = self.design_native_processes.contains(&process_id);
+            let was_active = was_canvas_active || was_native_active;
             if escape_pressed || (ctrl_now && enter_pressed) {
                 self.design_text_processes.remove(&process_id);
+                self.design_native_processes.remove(&process_id);
+                self.design_text_cursor_handles.remove(&process_id);
+                self.design_caret_suppressed.insert(process_id);
                 // Esc/Ctrl+Enter 一次就结束输入态，下一轮上下文立即回到英文。
                 self.last_left_click = None;
                 if escape_pressed && !was_active {
                     self.design_text_tools.remove(&process_id);
                 }
+                return false;
+            } else if enter_pressed && was_native_active {
+                // 图层/对象重命名使用 Enter 提交；画布多行文字中的 Enter 不退出。
+                self.design_native_processes.remove(&process_id);
+                self.design_caret_suppressed.insert(process_id);
+                return false;
             } else if t_pressed && !has_caret {
                 // T 只选择文字工具；等用户真正点击画布文字位置后才进入中文。
                 self.design_text_tools.insert(process_id);
-            } else if self.design_text_tools.contains(&process_id) && left_pressed {
-                if crate::cursor_detector::is_standard_arrow_cursor() {
-                    // 点击图层、工具栏等普通界面立即离开输入态，保证快捷键使用英文。
-                    self.design_text_processes.remove(&process_id);
-                } else {
-                    // 文字工具选中时，点击画布的文字光标位置才进入中文输入态。
-                    self.design_text_processes.insert(process_id);
-                }
-            } else if left_pressed {
-                // 双击已有文字重新进入编辑时，Photoshop/Illustrator 不公开系统 Caret。
-                // 只接受同一进程、同一位置附近的快速双击，避免普通界面单击被误判中文。
-                let mut point = POINT::default();
-                let have_point = unsafe { GetCursorPos(&mut point).is_ok() };
-                let double_click = have_point
-                    && self
-                        .last_left_click
-                        .as_ref()
-                        .is_some_and(|(at, pid, x, y)| {
-                            *pid == process_id
-                                && at.elapsed() <= Duration::from_millis(500)
-                                && (point.x - *x).abs() <= 8
-                                && (point.y - *y).abs() <= 8
-                        });
-                self.last_left_click =
-                    have_point.then_some((Instant::now(), process_id, point.x, point.y));
-                if double_click && !crate::cursor_detector::is_standard_arrow_cursor() {
+                self.design_native_processes.remove(&process_id);
+                self.design_caret_suppressed.insert(process_id);
+            } else if !was_active && (b_pressed || v_pressed) {
+                self.design_text_tools.remove(&process_id);
+                self.design_native_processes.remove(&process_id);
+                self.design_caret_suppressed.insert(process_id);
+            } else if was_canvas_active && (b_pressed || v_pressed) {
+                self.pending_design_tool_check = Some((process_id, Instant::now()));
+            }
+
+            if left_pressed {
+                if double_click && !standard_arrow {
                     self.design_text_tools.insert(process_id);
                     self.design_text_processes.insert(process_id);
+                    self.design_native_processes.remove(&process_id);
+                    self.design_caret_suppressed.remove(&process_id);
+                    if let Some(cursor) = crate::cursor_detector::current_cursor_handle() {
+                        self.design_text_cursor_handles.insert(process_id, cursor);
+                    }
                     self.last_left_click = None;
-                } else if crate::cursor_detector::is_standard_arrow_cursor() {
+                } else if double_click && standard_arrow {
+                    self.pending_design_native = Some((process_id, Instant::now()));
+                    self.design_caret_suppressed.remove(&process_id);
+                    if has_caret {
+                        self.design_native_processes.insert(process_id);
+                        self.pending_design_native = None;
+                    }
+                } else if self.design_text_tools.contains(&process_id) && !standard_arrow {
+                    self.design_text_processes.insert(process_id);
+                    self.design_native_processes.remove(&process_id);
+                    self.design_caret_suppressed.remove(&process_id);
+                    if let Some(cursor) = crate::cursor_detector::current_cursor_handle() {
+                        self.design_text_cursor_handles.insert(process_id, cursor);
+                    }
+                } else if has_caret && !self.design_caret_suppressed.contains(&process_id) {
+                    self.design_native_processes.insert(process_id);
+                } else if standard_arrow {
                     self.design_text_processes.remove(&process_id);
+                    self.design_native_processes.remove(&process_id);
+                    self.design_caret_suppressed.insert(process_id);
                 }
-            } else if !was_active && v_pressed {
-                self.design_text_tools.remove(&process_id);
             }
-            return self.design_text_processes.contains(&process_id);
+
+            if has_caret
+                && !self.design_caret_suppressed.contains(&process_id)
+                && !self.design_text_processes.contains(&process_id)
+            {
+                self.design_native_processes.insert(process_id);
+            }
+            return self.design_text_processes.contains(&process_id)
+                || self.design_native_processes.contains(&process_id);
         }
 
         self.design_text_processes.clear();
         self.design_text_tools.clear();
+        self.design_native_processes.clear();
+        self.design_caret_suppressed.clear();
+        self.design_text_cursor_handles.clear();
+        self.pending_design_native = None;
+        self.pending_design_tool_check = None;
+
+        if process_matches(process_name, OFFICE_EDIT_APPS) {
+            self.office_edit_processes.retain(|pid| *pid == process_id);
+            self.office_caret_suppressed
+                .retain(|pid| *pid == process_id);
+            let spreadsheet = process_matches(process_name, OFFICE_SPREADSHEET_APPS);
+
+            if !has_caret {
+                self.office_caret_suppressed.remove(&process_id);
+            }
+            if let Some((pid, started)) = self.pending_office_edit {
+                if pid != process_id || started.elapsed() > Duration::from_millis(450) {
+                    self.pending_office_edit = None;
+                } else if has_caret {
+                    self.office_caret_suppressed.remove(&process_id);
+                    self.office_edit_processes.insert(process_id);
+                    self.pending_office_edit = None;
+                }
+            }
+
+            if escape_pressed || (spreadsheet && enter_pressed) {
+                self.office_edit_processes.remove(&process_id);
+                self.office_caret_suppressed.insert(process_id);
+                self.pending_office_edit = None;
+                return false;
+            }
+
+            if left_pressed {
+                if double_click {
+                    // 单元格、已有文字与形状文字均以双击作为明确编辑信号。
+                    self.office_caret_suppressed.remove(&process_id);
+                    self.office_edit_processes.insert(process_id);
+                    self.pending_office_edit = None;
+                    self.last_left_click = None;
+                } else if has_caret && !self.office_caret_suppressed.contains(&process_id) {
+                    self.office_edit_processes.insert(process_id);
+                } else if !spreadsheet && !standard_arrow {
+                    self.office_edit_processes.insert(process_id);
+                    self.pending_office_edit = Some((process_id, Instant::now()));
+                } else {
+                    // 单击表格非编辑区或办公软件普通界面立即恢复英文。
+                    self.office_edit_processes.remove(&process_id);
+                    self.office_caret_suppressed.insert(process_id);
+                    self.pending_office_edit =
+                        (!spreadsheet).then_some((process_id, Instant::now()));
+                }
+            } else if has_caret && !self.office_caret_suppressed.contains(&process_id) {
+                self.office_edit_processes.insert(process_id);
+            }
+
+            return self.office_edit_processes.contains(&process_id);
+        }
+
+        self.office_edit_processes.clear();
+        self.office_caret_suppressed.clear();
+        self.pending_office_edit = None;
         self.last_left_click = None;
         false
     }
@@ -568,7 +756,7 @@ fn process_name(process_id: u32) -> Option<String> {
 mod tests {
     use super::{
         process_matches, CARET_COMPAT_APPS, CARET_FAST_PATH_APPS, DESIGN_TEXT_SHORTCUT_APPS,
-        INDICATOR_ONLY_APPS,
+        INDICATOR_ONLY_APPS, OFFICE_EDIT_APPS, OFFICE_SPREADSHEET_APPS,
     };
 
     #[test]
@@ -607,6 +795,24 @@ mod tests {
         assert!(process_matches("Photoshop.exe", CARET_FAST_PATH_APPS));
         assert!(process_matches("Illustrator.exe", CARET_FAST_PATH_APPS));
         assert!(process_matches("Cinema 4D.exe", CARET_FAST_PATH_APPS));
+    }
+
+    #[test]
+    fn wps_and_microsoft_office_use_edit_mode_tracking() {
+        for process in [
+            "wps.exe",
+            "et.exe",
+            "wpp.exe",
+            "WINWORD.EXE",
+            "EXCEL.EXE",
+            "POWERPNT.EXE",
+        ] {
+            assert!(process_matches(process, OFFICE_EDIT_APPS));
+            assert!(process_matches(process, CARET_COMPAT_APPS));
+        }
+        assert!(process_matches("et.exe", OFFICE_SPREADSHEET_APPS));
+        assert!(process_matches("EXCEL.EXE", OFFICE_SPREADSHEET_APPS));
+        assert!(!process_matches("wps.exe", OFFICE_SPREADSHEET_APPS));
     }
 }
 

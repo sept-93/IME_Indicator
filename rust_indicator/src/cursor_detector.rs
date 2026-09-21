@@ -1,11 +1,11 @@
 //! 鼠标光标形状检测模块
 
 use std::collections::HashSet;
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::HINSTANCE;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorInfo, LoadCursorW, CURSORINFO, CURSOR_SHOWING, HCURSOR, IDC_ARROW,
 };
-use windows::core::PCWSTR;
 
 /// 鼠标形状检测器
 pub struct CursorDetector {
@@ -16,6 +16,23 @@ pub struct CursorDetector {
 /// Adobe 等应用会使用自定义文字工具光标。用于区分画布文字点击与普通工具栏点击。
 pub fn is_standard_arrow_cursor() -> bool {
     is_shared_cursor(IDC_ARROW)
+}
+
+/// 返回当前可见鼠标光标的句柄，用于判断 Adobe 是否真的切换了工具。
+pub fn current_cursor_handle() -> Option<isize> {
+    unsafe {
+        let mut ci = CURSORINFO {
+            cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+            flags: CURSOR_SHOWING,
+            hCursor: HCURSOR::default(),
+            ptScreenPos: Default::default(),
+        };
+        if GetCursorInfo(&mut ci).is_ok() && !ci.hCursor.0.is_null() {
+            Some(ci.hCursor.0 as isize)
+        } else {
+            None
+        }
+    }
 }
 
 fn is_shared_cursor(cursor_id: PCWSTR) -> bool {
@@ -67,9 +84,11 @@ impl CursorDetector {
                 hCursor: HCURSOR::default(),
                 ptScreenPos: Default::default(),
             };
-            
+
             if GetCursorInfo(&mut ci).is_ok() {
-                return self.target_cursor_handles.contains(&(ci.hCursor.0 as isize));
+                return self
+                    .target_cursor_handles
+                    .contains(&(ci.hCursor.0 as isize));
             }
         }
         false

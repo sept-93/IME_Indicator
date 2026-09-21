@@ -54,7 +54,7 @@ pub struct AutoSwitcher {
     applied_context: Option<SwitchContextKey>,
     enabled_last: bool,
     last_switch_attempt: Instant,
-    english_retry_used: bool,
+    target_retry_used: bool,
 }
 
 impl AutoSwitcher {
@@ -65,7 +65,7 @@ impl AutoSwitcher {
             applied_context: None,
             enabled_last: crate::tray::smart_switch_enabled(),
             last_switch_attempt: Instant::now(),
-            english_retry_used: false,
+            target_retry_used: false,
         }
     }
 
@@ -89,7 +89,7 @@ impl AutoSwitcher {
         if changed {
             self.candidate = Some(context);
             self.candidate_since = Instant::now();
-            self.english_retry_used = false;
+            self.target_retry_used = false;
             // 输入框和搜索框优先响应：一旦检测到 Caret/Edit/Document 焦点，
             // 本轮立即切换。非输入区仍保留短暂防抖，避免切窗口时闪动。
             if !self
@@ -130,10 +130,10 @@ impl AutoSwitcher {
 
         let already_applied = self.applied_context.as_ref() == Some(&context_key);
         if already_applied
-            && !should_retry_english(
+            && !should_retry_target(
                 target,
                 chinese_mode,
-                self.english_retry_used,
+                self.target_retry_used,
                 self.last_switch_attempt.elapsed(),
             )
         {
@@ -141,7 +141,7 @@ impl AutoSwitcher {
         }
 
         if already_applied {
-            self.english_retry_used = true;
+            self.target_retry_used = true;
         } else {
             self.applied_context = Some(context_key);
         }
@@ -151,16 +151,17 @@ impl AutoSwitcher {
     }
 }
 
-fn should_retry_english(
+fn should_retry_target(
     target: LanguageTarget,
     chinese_mode: bool,
     retry_used: bool,
     elapsed: Duration,
 ) -> bool {
-    target == LanguageTarget::English
-        && chinese_mode
-        && !retry_used
-        && elapsed >= Duration::from_millis(250)
+    let state_mismatch = match target {
+        LanguageTarget::Chinese => !chinese_mode,
+        LanguageTarget::English => chinese_mode,
+    };
+    state_mismatch && !retry_used && elapsed >= Duration::from_millis(250)
 }
 
 fn default_rule_for_process(process_name: &str) -> &'static str {
@@ -220,31 +221,37 @@ fn switch_language(
 
     unsafe {
         let layout = LoadKeyboardLayoutW(PCWSTR(wide.as_ptr()), KLF_ACTIVATE)?;
-        let target_hwnd = if !focused_hwnd.0.is_null() {
-            focused_hwnd
-        } else {
-            foreground_hwnd
-        };
-        let mut result = 0usize;
-        let sent = SendMessageTimeoutW(
-            target_hwnd,
-            WM_INPUTLANGCHANGEREQUEST,
-            WPARAM(INPUTLANGCHANGE_SYSCHARSET),
-            LPARAM(layout.0 as isize),
-            SMTO_ABORTIFHUNG,
-            500,
-            Some(&mut result),
-        );
-        if sent.0 == 0 {
-            return Err(windows::core::Error::from_win32());
-        }
-
-        if target == LanguageTarget::Chinese {
-            let ime_hwnd = ImmGetDefaultIMEWnd(target_hwnd);
-            if !ime_hwnd.0.is_null() {
-                send_ime_control(ime_hwnd, IMC_SETOPENSTATUS, 1);
-                send_ime_control(ime_hwnd, IMC_SETCONVERSIONMODE, IME_CMODE_NATIVE);
+        let targets = [focused_hwnd, foreground_hwnd];
+        let mut any_sent = false;
+        for (index, target_hwnd) in targets.into_iter().enumerate() {
+            if target_hwnd.0.is_null() || (index == 1 && target_hwnd == focused_hwnd) {
+                continue;
             }
+            let mut result = 0usize;
+            let sent = SendMessageTimeoutW(
+                target_hwnd,
+                WM_INPUTLANGCHANGEREQUEST,
+                WPARAM(INPUTLANGCHANGE_SYSCHARSET),
+                LPARAM(layout.0 as isize),
+                SMTO_ABORTIFHUNG,
+                350,
+                Some(&mut result),
+            );
+            if sent.0 == 0 {
+                continue;
+            }
+            any_sent = true;
+
+            if target == LanguageTarget::Chinese {
+                let ime_hwnd = ImmGetDefaultIMEWnd(target_hwnd);
+                if !ime_hwnd.0.is_null() {
+                    send_ime_control(ime_hwnd, IMC_SETOPENSTATUS, 1);
+                    send_ime_control(ime_hwnd, IMC_SETCONVERSIONMODE, IME_CMODE_NATIVE);
+                }
+            }
+        }
+        if !any_sent {
+            return Err(windows::core::Error::from_win32());
         }
     }
     Ok(())
@@ -272,8 +279,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        default_rule_for_process, should_retry_english, target_for, LanguageTarget,
-        SwitchContextKey,
+        default_rule_for_process, should_retry_target, target_for, LanguageTarget, SwitchContextKey,
     };
     use crate::caret_detector::FocusContext;
 
@@ -343,22 +349,28 @@ mod tests {
     }
 
     #[test]
-    fn english_target_gets_only_one_delayed_correction() {
-        assert!(should_retry_english(
+    fn mismatched_target_gets_only_one_delayed_correction() {
+        assert!(should_retry_target(
             LanguageTarget::English,
             true,
             false,
             Duration::from_millis(300)
         ));
-        assert!(!should_retry_english(
+        assert!(!should_retry_target(
             LanguageTarget::English,
             true,
             true,
             Duration::from_secs(1)
         ));
-        assert!(!should_retry_english(
+        assert!(should_retry_target(
             LanguageTarget::Chinese,
             false,
+            false,
+            Duration::from_secs(1)
+        ));
+        assert!(!should_retry_target(
+            LanguageTarget::Chinese,
+            true,
             false,
             Duration::from_secs(1)
         ));
