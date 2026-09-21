@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use windows::Win32::Foundation::HINSTANCE;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorInfo, LoadCursorW, CURSORINFO, CURSOR_SHOWING, HCURSOR, IDC_ARROW, IDC_IBEAM,
+    GetCursorInfo, LoadCursorW, CURSORINFO, CURSOR_SHOWING, HCURSOR, IDC_ARROW,
 };
 use windows::core::PCWSTR;
 
@@ -16,10 +16,6 @@ pub struct CursorDetector {
 /// Adobe 等应用会使用自定义文字工具光标。用于区分画布文字点击与普通工具栏点击。
 pub fn is_standard_arrow_cursor() -> bool {
     is_shared_cursor(IDC_ARROW)
-}
-
-pub fn is_standard_ibeam_cursor() -> bool {
-    is_shared_cursor(IDC_IBEAM)
 }
 
 fn is_shared_cursor(cursor_id: PCWSTR) -> bool {

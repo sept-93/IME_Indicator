@@ -655,14 +655,14 @@ fn show_app_rule_editor() {
 
         // 未显式设置字体时，原生 LISTBOX/COMBOBOX 会退回难看的等宽系统字体。
         // 给全部子控件统一使用 Windows 默认界面字体，并立即重绘。
-        let font = create_ui_font(-18, FW_NORMAL.0 as i32);
-        let title_font = create_ui_font(-24, FW_SEMIBOLD.0 as i32);
+        let font = create_ui_font(-14, FW_NORMAL.0 as i32);
+        let title_font = create_ui_font(-18, FW_SEMIBOLD.0 as i32);
         let _ = EnumChildWindows(
             hwnd,
             Some(set_default_gui_font),
             LPARAM(font.0 as isize),
         );
-        let _ = SendMessageW(list, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(27));
+        let _ = SendMessageW(list, LB_SETITEMHEIGHT, WPARAM(0), LPARAM(22));
         if let Some(header) = header {
             let _ = SendMessageW(
                 header,
@@ -856,7 +856,7 @@ unsafe extern "system" fn collect_running_app(hwnd: HWND, lparam: LPARAM) -> BOO
     if copied <= 0 {
         return TRUE;
     }
-    let title = compact_window_title(&String::from_utf16_lossy(&title[..copied as usize]), 42);
+    let title = compact_window_title(&String::from_utf16_lossy(&title[..copied as usize]), 24);
     let apps = &mut *(lparam.0 as *mut Vec<RunningApp>);
     apps.push(RunningApp {
         display_name: format!("{}   ·   {}", exe_name, title),

@@ -158,10 +158,9 @@ fn should_retry_english(
 }
 
 fn default_rule_for_process(process_name: &str) -> &'static str {
-    // C4D 进入主界面时恢复英文；进入重命名区后不强制语言，只显示用户手动
-    // 选择的中英文状态，避免向其自绘输入循环持续发送切换请求。
+    // C4D 完全不接收自动切换消息；只由主循环读取系统 IME 状态并显示提示。
     if process_name.eq_ignore_ascii_case("Cinema 4D.exe") {
-        "c4d_manual"
+        "ignore"
     } else {
         "auto"
     }
@@ -170,8 +169,6 @@ fn default_rule_for_process(process_name: &str) -> &'static str {
 fn target_for(rule: &str, password: bool, editable: bool) -> Option<LanguageTarget> {
     match rule {
         "ignore" => None,
-        "c4d_manual" if editable => None,
-        "c4d_manual" => Some(LanguageTarget::English),
         "chinese" => Some(LanguageTarget::Chinese),
         "english" => Some(LanguageTarget::English),
         _ if password => Some(LanguageTarget::English),
@@ -318,13 +315,10 @@ mod tests {
 
     #[test]
     fn cinema_4d_is_indicator_only_by_default() {
-        assert_eq!(default_rule_for_process("Cinema 4D.exe"), "c4d_manual");
+        assert_eq!(default_rule_for_process("Cinema 4D.exe"), "ignore");
         assert_eq!(default_rule_for_process("Photoshop.exe"), "auto");
-        assert_eq!(
-            target_for("c4d_manual", false, false),
-            Some(LanguageTarget::English)
-        );
-        assert_eq!(target_for("c4d_manual", false, true), None);
+        assert_eq!(target_for("ignore", false, false), None);
+        assert_eq!(target_for("ignore", false, true), None);
     }
 
     #[test]

@@ -15,7 +15,7 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Accessibility::CUIAutomation;
 use windows::Win32::UI::Accessibility::IUIAutomation;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_F2, VK_LBUTTON, VK_RETURN,
+    GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_LBUTTON, VK_RETURN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
@@ -45,6 +45,10 @@ const CARET_FAST_PATH_APPS: &[&str] = &[
     "StartMenuExperienceHost.exe",
 ];
 
+/// 对这些应用不做 Caret/MSAA/UIA 或应用内编辑模式探测，只读取系统 IME 状态。
+/// Cinema 4D 的自绘消息循环对跨进程辅助功能查询非常敏感，频繁探测会造成卡顿。
+const INDICATOR_ONLY_APPS: &[&str] = &["Cinema 4D.exe"];
+
 /// 浏览器和富文本应用常把真正的编辑区暴露为 Custom/Text/Group，而不是标准 Edit。
 /// 仅对这些已验证应用允许用当前线程的真实 Caret 补足 UIA，避免重新放宽到所有
 /// 自绘程序（eCloud、FlClash 等会在非输入区保留假的 Caret）。
@@ -60,7 +64,6 @@ const CARET_COMPAT_APPS: &[&str] = &[
 /// Photoshop/Illustrator 的画布文字光标完全由应用绘制，Windows 没有 Caret 对象。
 /// 在这些应用内按 T 进入文字工具后进入兼容输入模式，Esc 或 Ctrl+Enter 退出。
 const DESIGN_TEXT_SHORTCUT_APPS: &[&str] = &["Photoshop.exe", "Illustrator.exe"];
-const DESIGN_RENAME_SHORTCUT_APPS: &[&str] = &["Cinema 4D.exe"];
 
 // ============================================================================
 // 类型定义
@@ -116,7 +119,6 @@ pub struct CaretDetector {
     t_down: bool,
     escape_down: bool,
     enter_down: bool,
-    f2_down: bool,
     left_down: bool,
     v_down: bool,
 }
@@ -142,7 +144,6 @@ impl CaretDetector {
             t_down: false,
             escape_down: false,
             enter_down: false,
-            f2_down: false,
             left_down: false,
             v_down: false,
         }
@@ -298,7 +299,6 @@ impl CaretDetector {
         let (t_now, t_since_last) = key_sample(0x54); // T
         let (escape_now, escape_since_last) = key_sample(VK_ESCAPE.0 as i32);
         let (enter_now, enter_since_last) = key_sample(VK_RETURN.0 as i32);
-        let (f2_now, f2_since_last) = key_sample(VK_F2.0 as i32);
         let (left_now, left_since_last) = key_sample(VK_LBUTTON.0 as i32);
         let (v_now, v_since_last) = key_sample(0x56); // V
         let (ctrl_now, _) = key_sample(VK_CONTROL.0 as i32);
@@ -308,13 +308,11 @@ impl CaretDetector {
         let t_pressed = t_since_last || (t_now && !self.t_down);
         let escape_pressed = escape_since_last || (escape_now && !self.escape_down);
         let enter_pressed = enter_since_last || (enter_now && !self.enter_down);
-        let f2_pressed = f2_since_last || (f2_now && !self.f2_down);
         let left_pressed = left_since_last || (left_now && !self.left_down);
         let v_pressed = v_since_last || (v_now && !self.v_down);
         self.t_down = t_now;
         self.escape_down = escape_now;
         self.enter_down = enter_now;
-        self.f2_down = f2_now;
         self.left_down = left_now;
         self.v_down = v_now;
 
@@ -347,28 +345,6 @@ impl CaretDetector {
             return self.design_text_processes.contains(&process_id);
         }
 
-        if process_matches(process_name, DESIGN_RENAME_SHORTCUT_APPS) {
-            let was_active = self.design_text_processes.contains(&process_id);
-            if escape_pressed || (was_active && enter_pressed) {
-                self.design_text_processes.remove(&process_id);
-            } else if was_active
-                && left_pressed
-                && crate::cursor_detector::is_standard_arrow_cursor()
-            {
-                // 点击回主界面后退出重命名输入态，恢复英文快捷键环境。
-                self.design_text_processes.remove(&process_id);
-            } else if !has_caret
-                && (f2_pressed
-                    || enter_pressed
-                    || crate::cursor_detector::is_standard_ibeam_cursor())
-            {
-                // Cinema 4D 官方支持选中对象后按 Return（部分区域为 F2）进入重命名。
-                // 鼠标双击名称后，编辑框会把指针变成标准 I-Beam，也据此锁定输入态。
-                self.design_text_processes.insert(process_id);
-            }
-            return self.design_text_processes.contains(&process_id);
-        }
-
         false
     }
 
@@ -379,6 +355,10 @@ impl CaretDetector {
 
     /// 多级检测：按配置的 methods 顺序依次尝试
     fn detect(&mut self) -> Option<CaretPos> {
+        if foreground_process_matches(INDICATOR_ONLY_APPS) {
+            self.last_source = DetectionSource::None;
+            return None;
+        }
         for name in crate::config::caret_methods() {
             let Some(method) = DetectionSource::from_name(name) else {
                 continue;
@@ -503,6 +483,16 @@ impl CaretDetector {
     }
 }
 
+fn foreground_process_matches(candidates: &[&str]) -> bool {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        let mut process_id = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+        process_name(process_id)
+            .is_some_and(|name| process_matches(&name, candidates))
+    }
+}
+
 fn process_matches(process_name: &str, candidates: &[&str]) -> bool {
     candidates
         .iter()
@@ -541,8 +531,8 @@ fn process_name(process_id: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        process_matches, CARET_COMPAT_APPS, CARET_FAST_PATH_APPS, DESIGN_RENAME_SHORTCUT_APPS,
-        DESIGN_TEXT_SHORTCUT_APPS,
+        process_matches, CARET_COMPAT_APPS, CARET_FAST_PATH_APPS, DESIGN_TEXT_SHORTCUT_APPS,
+        INDICATOR_ONLY_APPS,
     };
 
     #[test]
@@ -574,10 +564,7 @@ mod tests {
             DESIGN_TEXT_SHORTCUT_APPS
         ));
         assert!(!process_matches("Cinema 4D.exe", DESIGN_TEXT_SHORTCUT_APPS));
-        assert!(process_matches(
-            "Cinema 4D.exe",
-            DESIGN_RENAME_SHORTCUT_APPS
-        ));
+        assert!(process_matches("Cinema 4D.exe", INDICATOR_ONLY_APPS));
         assert!(process_matches("Photoshop.exe", CARET_FAST_PATH_APPS));
         assert!(process_matches("Illustrator.exe", CARET_FAST_PATH_APPS));
         assert!(process_matches("Cinema 4D.exe", CARET_FAST_PATH_APPS));
