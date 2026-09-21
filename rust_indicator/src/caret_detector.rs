@@ -33,7 +33,12 @@ const IID_IACCESSIBLE: u128 = 0x618736e0_3c3d_11cf_810c_00aa00389b71;
 
 /// 这些自绘应用不暴露可靠的 UIA 子控件；查询焦点元素会阻塞数秒。
 /// 直接使用 Caret 或应用专用状态判断，避免 UIA 卡顿。
-const CARET_FAST_PATH_APPS: &[&str] = &["Weixin.exe", "Cinema 4D.exe"];
+const CARET_FAST_PATH_APPS: &[&str] = &[
+    "Weixin.exe",
+    "Photoshop.exe",
+    "Illustrator.exe",
+    "Cinema 4D.exe",
+];
 
 /// 浏览器和富文本应用常把真正的编辑区暴露为 Custom/Text/Group，而不是标准 Edit。
 /// 仅对这些已验证应用允许用当前线程的真实 Caret 补足 UIA，避免重新放宽到所有
@@ -550,6 +555,8 @@ mod tests {
         assert!(process_matches("Illustrator.exe", DESIGN_TEXT_SHORTCUT_APPS));
         assert!(!process_matches("Cinema 4D.exe", DESIGN_TEXT_SHORTCUT_APPS));
         assert!(process_matches("Cinema 4D.exe", DESIGN_RENAME_SHORTCUT_APPS));
+        assert!(process_matches("Photoshop.exe", CARET_FAST_PATH_APPS));
+        assert!(process_matches("Illustrator.exe", CARET_FAST_PATH_APPS));
         assert!(process_matches("Cinema 4D.exe", CARET_FAST_PATH_APPS));
     }
 }
