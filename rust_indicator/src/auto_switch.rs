@@ -112,10 +112,21 @@ impl AutoSwitcher {
         self.applied_context = Some(context_key);
 
         let process_name = process_name(context.process_id).unwrap_or_default();
-        let rule = crate::config::auto_switch_app_rule(&process_name).unwrap_or("auto");
+        let rule = crate::config::auto_switch_app_rule(&process_name)
+            .unwrap_or_else(|| default_rule_for_process(&process_name));
         let Some(target) = target_for(rule, context.password, context.editable) else { return };
 
         let _ = switch_language(context.focused_hwnd, context.foreground_hwnd, target);
+    }
+}
+
+fn default_rule_for_process(process_name: &str) -> &'static str {
+    // Cinema 4D 的输入控件和主界面共用自绘消息循环，自动发送语言切换请求
+    // 容易造成卡顿。默认只显示状态；用户仍可用 app_rules 显式覆盖。
+    if process_name.eq_ignore_ascii_case("Cinema 4D.exe") {
+        "ignore"
+    } else {
+        "auto"
     }
 }
 
@@ -205,7 +216,7 @@ fn send_ime_control(hwnd: HWND, command: usize, value: isize) {
 mod tests {
     use windows::Win32::Foundation::HWND;
 
-    use super::{target_for, LanguageTarget, SwitchContextKey};
+    use super::{default_rule_for_process, target_for, LanguageTarget, SwitchContextKey};
     use crate::caret_detector::FocusContext;
 
     fn context(editable: bool, password: bool) -> FocusContext {
@@ -233,6 +244,12 @@ mod tests {
         assert_eq!(target_for("chinese", true, false), Some(LanguageTarget::Chinese));
         assert_eq!(target_for("english", false, true), Some(LanguageTarget::English));
         assert_eq!(target_for("ignore", false, true), None);
+    }
+
+    #[test]
+    fn cinema_4d_is_indicator_only_by_default() {
+        assert_eq!(default_rule_for_process("Cinema 4D.exe"), "ignore");
+        assert_eq!(default_rule_for_process("Photoshop.exe"), "auto");
     }
 
     #[test]

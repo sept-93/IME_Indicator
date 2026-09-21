@@ -32,8 +32,8 @@ const OBJID_CARET: u32 = 0xFFFFFFF8u32;
 const IID_IACCESSIBLE: u128 = 0x618736e0_3c3d_11cf_810c_00aa00389b71;
 
 /// 这些自绘应用不暴露可靠的 UIA 子控件；查询焦点元素会阻塞数秒。
-/// 它们已有可靠的 Win32/MSAA Caret，因此直接使用 Caret 状态判断输入区。
-const CARET_FAST_PATH_APPS: &[&str] = &["Weixin.exe"];
+/// 直接使用 Caret 或应用专用状态判断，避免 UIA 卡顿。
+const CARET_FAST_PATH_APPS: &[&str] = &["Weixin.exe", "Cinema 4D.exe"];
 
 /// 浏览器和富文本应用常把真正的编辑区暴露为 Custom/Text/Group，而不是标准 Edit。
 /// 仅对这些已验证应用允许用当前线程的真实 Caret 补足 UIA，避免重新放宽到所有
@@ -45,9 +45,6 @@ const CARET_COMPAT_APPS: &[&str] = &[
     "Tabbit Browser.exe",
     "Feishu.exe",
     "Lark.exe",
-    "Photoshop.exe",
-    "Illustrator.exe",
-    "Cinema 4D.exe",
 ];
 
 /// Photoshop/Illustrator 的画布文字光标完全由应用绘制，Windows 没有 Caret 对象。
@@ -186,10 +183,10 @@ impl CaretDetector {
                     foreground_hwnd,
                     focused_hwnd,
                     process_id,
-                    editable: has_caret,
+                    editable: has_caret || design_text_mode,
                     password: false,
                     readonly_document: false,
-                    force_mouse_indicator: false,
+                    force_mouse_indicator: design_text_mode && !has_caret,
                 };
             }
 
@@ -330,15 +327,16 @@ impl CaretDetector {
                     self.design_text_tools.remove(&process_id);
                 }
             } else if t_pressed && !has_caret {
+                // T 只选择文字工具；等用户真正点击画布文字位置后才进入中文。
                 self.design_text_tools.insert(process_id);
-                self.design_text_processes.insert(process_id);
-            } else if !was_active
-                && self.design_text_tools.contains(&process_id)
-                && left_pressed
-                && !crate::cursor_detector::is_standard_arrow_cursor()
-            {
-                // 退出一个文字对象后，文字工具仍处于选中状态。再次点击画布时恢复输入态。
-                self.design_text_processes.insert(process_id);
+            } else if self.design_text_tools.contains(&process_id) && left_pressed {
+                if crate::cursor_detector::is_standard_arrow_cursor() {
+                    // 点击图层、工具栏等普通界面立即离开输入态，保证快捷键使用英文。
+                    self.design_text_processes.remove(&process_id);
+                } else {
+                    // 文字工具选中时，点击画布的文字光标位置才进入中文输入态。
+                    self.design_text_processes.insert(process_id);
+                }
             } else if !was_active && v_pressed {
                 self.design_text_tools.remove(&process_id);
             }
@@ -539,9 +537,9 @@ mod tests {
         assert!(process_matches("chrome.exe", CARET_COMPAT_APPS));
         assert!(process_matches("Tabbit Browser.exe", CARET_COMPAT_APPS));
         assert!(process_matches("Feishu.exe", CARET_COMPAT_APPS));
-        assert!(process_matches("Photoshop.exe", CARET_COMPAT_APPS));
-        assert!(process_matches("Illustrator.exe", CARET_COMPAT_APPS));
-        assert!(process_matches("Cinema 4D.exe", CARET_COMPAT_APPS));
+        assert!(!process_matches("Photoshop.exe", CARET_COMPAT_APPS));
+        assert!(!process_matches("Illustrator.exe", CARET_COMPAT_APPS));
+        assert!(!process_matches("Cinema 4D.exe", CARET_COMPAT_APPS));
         assert!(!process_matches("eCloud.exe", CARET_COMPAT_APPS));
         assert!(!process_matches("FlClash.exe", CARET_COMPAT_APPS));
     }
@@ -552,6 +550,7 @@ mod tests {
         assert!(process_matches("Illustrator.exe", DESIGN_TEXT_SHORTCUT_APPS));
         assert!(!process_matches("Cinema 4D.exe", DESIGN_TEXT_SHORTCUT_APPS));
         assert!(process_matches("Cinema 4D.exe", DESIGN_RENAME_SHORTCUT_APPS));
+        assert!(process_matches("Cinema 4D.exe", CARET_FAST_PATH_APPS));
     }
 }
 
