@@ -15,7 +15,7 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Accessibility::CUIAutomation;
 use windows::Win32::UI::Accessibility::IUIAutomation;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_RETURN,
+    GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_F2, VK_LBUTTON, VK_RETURN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
@@ -53,6 +53,7 @@ const CARET_COMPAT_APPS: &[&str] = &[
 /// Photoshop/Illustrator 的画布文字光标完全由应用绘制，Windows 没有 Caret 对象。
 /// 在这些应用内按 T 进入文字工具后进入兼容输入模式，Esc 或 Ctrl+Enter 退出。
 const DESIGN_TEXT_SHORTCUT_APPS: &[&str] = &["Photoshop.exe", "Illustrator.exe"];
+const DESIGN_RENAME_SHORTCUT_APPS: &[&str] = &["Cinema 4D.exe"];
 
 // ============================================================================
 // 类型定义
@@ -104,9 +105,13 @@ pub struct CaretDetector {
     pub last_source: DetectionSource,
     pub last_uia_error: String,
     design_text_processes: HashSet<u32>,
+    design_text_tools: HashSet<u32>,
     t_down: bool,
     escape_down: bool,
     enter_down: bool,
+    f2_down: bool,
+    left_down: bool,
+    v_down: bool,
 }
 
 impl CaretDetector {
@@ -126,9 +131,13 @@ impl CaretDetector {
             last_source: DetectionSource::None,
             last_uia_error: String::new(),
             design_text_processes: HashSet::new(),
+            design_text_tools: HashSet::new(),
             t_down: false,
             escape_down: false,
             enter_down: false,
+            f2_down: false,
+            left_down: false,
+            v_down: false,
         }
     }
 
@@ -285,29 +294,74 @@ impl CaretDetector {
         process_id: u32,
         has_caret: bool,
     ) -> bool {
-        let t_now = key_down(0x54); // T
-        let escape_now = key_down(VK_ESCAPE.0 as i32);
-        let enter_now = key_down(VK_RETURN.0 as i32);
-        let ctrl_now = key_down(VK_CONTROL.0 as i32);
+        let (t_now, t_since_last) = key_sample(0x54); // T
+        let (escape_now, escape_since_last) = key_sample(VK_ESCAPE.0 as i32);
+        let (enter_now, enter_since_last) = key_sample(VK_RETURN.0 as i32);
+        let (f2_now, f2_since_last) = key_sample(VK_F2.0 as i32);
+        let (left_now, left_since_last) = key_sample(VK_LBUTTON.0 as i32);
+        let (v_now, v_since_last) = key_sample(0x56); // V
+        let (ctrl_now, _) = key_sample(VK_CONTROL.0 as i32);
 
-        let t_pressed = t_now && !self.t_down;
-        let escape_pressed = escape_now && !self.escape_down;
-        let enter_pressed = enter_now && !self.enter_down;
+        // 同时使用高位按键状态和低位“自上次查询后按过”标志，避免短按 T/Esc
+        // 刚好落在两次 30ms 轮询之间，造成 Illustrator 偶发无法进入或退出。
+        let t_pressed = t_since_last || (t_now && !self.t_down);
+        let escape_pressed = escape_since_last || (escape_now && !self.escape_down);
+        let enter_pressed = enter_since_last || (enter_now && !self.enter_down);
+        let f2_pressed = f2_since_last || (f2_now && !self.f2_down);
+        let left_pressed = left_since_last || (left_now && !self.left_down);
+        let v_pressed = v_since_last || (v_now && !self.v_down);
         self.t_down = t_now;
         self.escape_down = escape_now;
         self.enter_down = enter_now;
+        self.f2_down = f2_now;
+        self.left_down = left_now;
+        self.v_down = v_now;
 
-        if !process_matches(process_name, DESIGN_TEXT_SHORTCUT_APPS) || process_id == 0 {
+        if process_id == 0 {
             return false;
         }
 
-        if escape_pressed || (ctrl_now && enter_pressed) {
-            self.design_text_processes.remove(&process_id);
-        } else if t_pressed && !has_caret {
-            self.design_text_processes.insert(process_id);
+        if process_matches(process_name, DESIGN_TEXT_SHORTCUT_APPS) {
+            let was_active = self.design_text_processes.contains(&process_id);
+            if escape_pressed || (ctrl_now && enter_pressed) {
+                self.design_text_processes.remove(&process_id);
+                // 第一次 Esc 结束文字编辑但保留文字工具；第二次 Esc 完全退出工具。
+                if escape_pressed && !was_active {
+                    self.design_text_tools.remove(&process_id);
+                }
+            } else if t_pressed && !has_caret {
+                self.design_text_tools.insert(process_id);
+                self.design_text_processes.insert(process_id);
+            } else if !was_active
+                && self.design_text_tools.contains(&process_id)
+                && left_pressed
+                && !crate::cursor_detector::is_standard_arrow_cursor()
+            {
+                // 退出一个文字对象后，文字工具仍处于选中状态。再次点击画布时恢复输入态。
+                self.design_text_processes.insert(process_id);
+            } else if !was_active && v_pressed {
+                self.design_text_tools.remove(&process_id);
+            }
+            return self.design_text_processes.contains(&process_id);
         }
 
-        self.design_text_processes.contains(&process_id)
+        if process_matches(process_name, DESIGN_RENAME_SHORTCUT_APPS) {
+            let was_active = self.design_text_processes.contains(&process_id);
+            if escape_pressed || (was_active && enter_pressed) {
+                self.design_text_processes.remove(&process_id);
+            } else if !has_caret
+                && (f2_pressed
+                    || enter_pressed
+                    || crate::cursor_detector::is_standard_ibeam_cursor())
+            {
+                // Cinema 4D 官方支持选中对象后按 Return（部分区域为 F2）进入重命名。
+                // 鼠标双击名称后，编辑框会把指针变成标准 I-Beam，也据此锁定输入态。
+                self.design_text_processes.insert(process_id);
+            }
+            return self.design_text_processes.contains(&process_id);
+        }
+
+        false
     }
 
     /// 核心：按配置管线检测光标位置
@@ -439,8 +493,9 @@ fn process_matches(process_name: &str, candidates: &[&str]) -> bool {
         .any(|candidate| process_name.eq_ignore_ascii_case(candidate))
 }
 
-fn key_down(vkey: i32) -> bool {
-    unsafe { (GetAsyncKeyState(vkey) as u16 & 0x8000) != 0 }
+fn key_sample(vkey: i32) -> (bool, bool) {
+    let state = unsafe { GetAsyncKeyState(vkey) as u16 };
+    ((state & 0x8000) != 0, (state & 0x0001) != 0)
 }
 
 fn process_name(process_id: u32) -> Option<String> {
@@ -471,7 +526,7 @@ fn process_name(process_id: u32) -> Option<String> {
 mod tests {
     use super::{
         process_matches, CARET_COMPAT_APPS, CARET_FAST_PATH_APPS,
-        DESIGN_TEXT_SHORTCUT_APPS,
+        DESIGN_RENAME_SHORTCUT_APPS, DESIGN_TEXT_SHORTCUT_APPS,
     };
 
     #[test]
@@ -496,6 +551,7 @@ mod tests {
         assert!(process_matches("Photoshop.exe", DESIGN_TEXT_SHORTCUT_APPS));
         assert!(process_matches("Illustrator.exe", DESIGN_TEXT_SHORTCUT_APPS));
         assert!(!process_matches("Cinema 4D.exe", DESIGN_TEXT_SHORTCUT_APPS));
+        assert!(process_matches("Cinema 4D.exe", DESIGN_RENAME_SHORTCUT_APPS));
     }
 }
 

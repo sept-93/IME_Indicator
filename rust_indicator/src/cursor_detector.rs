@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use windows::Win32::Foundation::HINSTANCE;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorInfo, LoadCursorW, CURSORINFO, CURSOR_SHOWING, HCURSOR,
+    GetCursorInfo, LoadCursorW, CURSORINFO, CURSOR_SHOWING, HCURSOR, IDC_ARROW, IDC_IBEAM,
 };
 use windows::core::PCWSTR;
 
@@ -11,6 +11,30 @@ use windows::core::PCWSTR;
 pub struct CursorDetector {
     /// 目标光标句柄集合
     target_cursor_handles: HashSet<isize>,
+}
+
+/// Adobe 等应用会使用自定义文字工具光标。用于区分画布文字点击与普通工具栏点击。
+pub fn is_standard_arrow_cursor() -> bool {
+    is_shared_cursor(IDC_ARROW)
+}
+
+pub fn is_standard_ibeam_cursor() -> bool {
+    is_shared_cursor(IDC_IBEAM)
+}
+
+fn is_shared_cursor(cursor_id: PCWSTR) -> bool {
+    unsafe {
+        let Ok(expected) = LoadCursorW(HINSTANCE::default(), cursor_id) else {
+            return false;
+        };
+        let mut ci = CURSORINFO {
+            cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+            flags: CURSOR_SHOWING,
+            hCursor: HCURSOR::default(),
+            ptScreenPos: Default::default(),
+        };
+        GetCursorInfo(&mut ci).is_ok() && ci.hCursor == expected
+    }
 }
 
 impl CursorDetector {

@@ -133,6 +133,8 @@ fn run_detector_loop(running: Arc<AtomicBool>) {
 
     let mut last_state_check_time = Instant::now();
     let mut chinese_mode = false;
+    let mut previous_chinese_mode: Option<bool> = None;
+    let mut state_hint_until: Option<Instant> = None;
     let mut caret_active = false;
     let mut mouse_active = false;
 
@@ -149,6 +151,16 @@ fn run_detector_loop(running: Arc<AtomicBool>) {
             let readonly_document = focus_context.readonly_document;
             let force_mouse_indicator = focus_context.force_mouse_indicator;
             auto_switcher.observe(focus_context);
+
+            // 未识别控件中手动切换输入法时，也在鼠标旁短暂显示当前颜色，避免
+            // “已经切成中文/英文但完全没有标识”的情况，同时不恢复全局常驻假点。
+            if previous_chinese_mode.is_some_and(|previous| previous != chinese_mode)
+                && !focus_editable
+            {
+                state_hint_until = Some(now + Duration::from_millis(1500));
+            }
+            previous_chinese_mode = Some(chinese_mode);
+            let state_hint_active = state_hint_until.is_some_and(|deadline| now < deadline);
 
             // Caret 状态判断
             if config::caret_enable() {
@@ -173,8 +185,9 @@ fn run_detector_loop(running: Arc<AtomicBool>) {
             if config::mouse_enable() {
                 if let Some(ref overlay) = mouse_overlay {
                     let target_cursor = cursor_detector.is_target_cursor();
-                    let should_mouse = focus_editable
-                        && (target_cursor || force_mouse_indicator)
+                    let should_mouse = ((focus_editable
+                        && (target_cursor || force_mouse_indicator))
+                        || state_hint_active)
                         && (chinese_mode || config::mouse_show_en());
                     if should_mouse != mouse_active {
                         mouse_active = should_mouse;
