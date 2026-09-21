@@ -35,6 +35,8 @@ const IID_IACCESSIBLE: u128 = 0x618736e0_3c3d_11cf_810c_00aa00389b71;
 /// 直接使用 Caret 或应用专用状态判断，避免 UIA 卡顿。
 const CARET_FAST_PATH_APPS: &[&str] = &[
     "Weixin.exe",
+    "WXWork.exe",
+    "WeCom.exe",
     "Photoshop.exe",
     "Illustrator.exe",
     "Cinema 4D.exe",
@@ -535,6 +537,8 @@ mod tests {
     #[test]
     fn wechat_uses_caret_fast_path() {
         assert!(process_matches("weixin.exe", CARET_FAST_PATH_APPS));
+        assert!(process_matches("WXWork.exe", CARET_FAST_PATH_APPS));
+        assert!(process_matches("WeCom.exe", CARET_FAST_PATH_APPS));
     }
 
     #[test]
