@@ -44,6 +44,12 @@ const CARET_FAST_PATH_APPS: &[&str] = &[
     "SearchHost.exe",
     "SearchApp.exe",
     "StartMenuExperienceHost.exe",
+    "wps.exe",
+    "et.exe",
+    "wpp.exe",
+    "WINWORD.EXE",
+    "EXCEL.EXE",
+    "POWERPNT.EXE",
 ];
 
 /// 对这些应用不做 Caret/MSAA/UIA 或应用内编辑模式探测，只读取系统 IME 状态。
@@ -222,7 +228,9 @@ impl CaretDetector {
             // 微信等自绘应用的 UIA GetFocusedElement 会卡住约 3 秒，并且最终只返回
             // 顶层窗口。Win32/MSAA Caret 已能可靠反映聊天框和搜索框是否可输入。
             if process_matches(&process_name, CARET_FAST_PATH_APPS) {
-                let editable = if process_matches(&process_name, DESIGN_TEXT_SHORTCUT_APPS) {
+                let strict_special_mode = process_matches(&process_name, DESIGN_TEXT_SHORTCUT_APPS)
+                    || process_matches(&process_name, OFFICE_EDIT_APPS);
+                let editable = if strict_special_mode {
                     special_edit_mode
                 } else {
                     has_caret || special_edit_mode
@@ -487,12 +495,14 @@ impl CaretDetector {
                     if let Some(cursor) = crate::cursor_detector::current_cursor_handle() {
                         self.design_text_cursor_handles.insert(process_id, cursor);
                     }
-                } else if has_caret && !self.design_caret_suppressed.contains(&process_id) {
-                    self.design_native_processes.insert(process_id);
                 } else if standard_arrow {
+                    // 普通区域点击必须优先于旧 Caret；否则图层重命名结束后
+                    // Photoshop 残留的一帧 Caret 会把退出动作重新覆盖成中文。
                     self.design_text_processes.remove(&process_id);
                     self.design_native_processes.remove(&process_id);
                     self.design_caret_suppressed.insert(process_id);
+                } else if has_caret && !self.design_caret_suppressed.contains(&process_id) {
+                    self.design_native_processes.insert(process_id);
                 }
             }
 
@@ -547,6 +557,12 @@ impl CaretDetector {
                     self.office_edit_processes.insert(process_id);
                     self.pending_office_edit = None;
                     self.last_left_click = None;
+                } else if spreadsheet {
+                    // 表格单击只是选中单元格，必须退出编辑；第二次点击组成双击时
+                    // 再进入中文，避免旧 Caret 让整个表格一直保持中文。
+                    self.office_edit_processes.remove(&process_id);
+                    self.office_caret_suppressed.insert(process_id);
+                    self.pending_office_edit = None;
                 } else if has_caret && !self.office_caret_suppressed.contains(&process_id) {
                     self.office_edit_processes.insert(process_id);
                 } else if !spreadsheet && !standard_arrow {

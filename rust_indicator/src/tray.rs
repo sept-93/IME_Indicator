@@ -1,5 +1,7 @@
 use windows::core::{w, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, LRESULT, TRUE, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, BOOL, COLORREF, HWND, LPARAM, LRESULT, TRUE, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     CreateFontW, DeleteObject, GetSysColorBrush, SetBkMode, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
     COLOR_WINDOW, DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, HBRUSH, HDC,
@@ -19,10 +21,11 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Controls::{
-    ImageList_Create, ImageList_Destroy, ImageList_ReplaceIcon, InitCommonControlsEx, HIMAGELIST,
-    ICC_LISTVIEW_CLASSES, ILC_COLOR32, ILC_MASK, INITCOMMONCONTROLSEX, LVCF_WIDTH, LVCOLUMNW,
-    LVIF_IMAGE, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
-    LVM_INSERTITEMW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST, LVNI_SELECTED, LVSIL_SMALL,
+    ImageList_Create, ImageList_Destroy, ImageList_ReplaceIcon, ImageList_SetBkColor,
+    InitCommonControlsEx, CLR_NONE, HIMAGELIST, ICC_LISTVIEW_CLASSES, ILC_COLOR32,
+    INITCOMMONCONTROLSEX, LVCF_WIDTH, LVCOLUMNW, LVIF_IMAGE, LVIF_TEXT, LVITEMW,
+    LVM_DELETEALLITEMS, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST, LVNI_SELECTED, LVSIL_SMALL,
     LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOCOLUMNHEADER, LVS_REPORT, LVS_SHOWSELALWAYS,
     LVS_SINGLESEL,
 };
@@ -511,8 +514,8 @@ fn show_app_rule_editor() {
         };
         let _ = RegisterClassW(&window_class);
 
-        const EDITOR_WIDTH: i32 = 350;
-        const EDITOR_HEIGHT: i32 = 555;
+        const EDITOR_WIDTH: i32 = 400;
+        const EDITOR_HEIGHT: i32 = 535;
         let editor_x = ((GetSystemMetrics(SM_CXSCREEN) - EDITOR_WIDTH) / 2).max(0);
         let editor_y = ((GetSystemMetrics(SM_CYSCREEN) - EDITOR_HEIGHT) / 2).max(0);
 
@@ -540,9 +543,9 @@ fn show_app_rule_editor() {
             w!("应用规则"),
             WS_CHILD | WS_VISIBLE,
             16,
-            14,
+            10,
             240,
-            28,
+            24,
             hwnd,
             None,
             h_instance,
@@ -555,8 +558,8 @@ fn show_app_rule_editor() {
             w!("选择已打开的应用并设置处理方式。"),
             WS_CHILD | WS_VISIBLE,
             16,
-            44,
-            318,
+            35,
+            368,
             20,
             hwnd,
             None,
@@ -572,9 +575,9 @@ fn show_app_rule_editor() {
                 | WS_TABSTOP
                 | WINDOW_STYLE(LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOCOLUMNHEADER),
             16,
-            68,
-            318,
-            294,
+            58,
+            368,
+            285,
             hwnd,
             HMENU(IDC_APP_LIST as usize as *mut _),
             h_instance,
@@ -586,7 +589,7 @@ fn show_app_rule_editor() {
         };
         let column = LVCOLUMNW {
             mask: LVCF_WIDTH,
-            cx: 312,
+            cx: 344,
             ..Default::default()
         };
         let _ = SendMessageW(
@@ -607,7 +610,7 @@ fn show_app_rule_editor() {
             w!("处理方式"),
             WS_CHILD | WS_VISIBLE,
             16,
-            370,
+            348,
             120,
             22,
             hwnd,
@@ -625,11 +628,11 @@ fn show_app_rule_editor() {
             "删除自定义规则",
         ];
         let positions = [
-            (16, 394, 132),
-            (146, 394, 92),
-            (236, 394, 92),
-            (16, 422, 112),
-            (128, 422, 142),
+            (16, 372, 135),
+            (151, 372, 105),
+            (256, 372, 105),
+            (16, 398, 120),
+            (136, 398, 150),
         ];
         for (index, label) in rule_labels.iter().enumerate() {
             let group = if index == 0 {
@@ -674,8 +677,8 @@ fn show_app_rule_editor() {
             w!("BUTTON"),
             w!("刷新列表"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            128,
-            450,
+            174,
+            430,
             96,
             32,
             hwnd,
@@ -688,9 +691,9 @@ fn show_app_rule_editor() {
             w!("BUTTON"),
             w!("保存并应用"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
-            232,
-            450,
-            102,
+            276,
+            430,
+            108,
             32,
             hwnd,
             HMENU(IDC_SAVE_RULE as usize as *mut _),
@@ -703,8 +706,8 @@ fn show_app_rule_editor() {
             w!("提示：自动识别仅补充输入框检测。"),
             WS_CHILD | WS_VISIBLE,
             16,
-            490,
-            318,
+            470,
+            368,
             18,
             hwnd,
             None,
@@ -970,10 +973,11 @@ fn process_info_from_id(process_id: u32) -> Option<(String, PathBuf)> {
 }
 
 unsafe fn create_app_image_list(apps: &[RunningApp]) -> (Option<HIMAGELIST>, Vec<i32>) {
-    let images = ImageList_Create(28, 28, ILC_COLOR32 | ILC_MASK, apps.len().max(1) as i32, 4);
+    let images = ImageList_Create(28, 28, ILC_COLOR32, apps.len().max(1) as i32, 4);
     if images.0 == 0 {
         return (None, vec![-1; apps.len()]);
     }
+    let _ = ImageList_SetBkColor(images, COLORREF(CLR_NONE as u32));
 
     let mut image_indices = Vec::with_capacity(apps.len());
     for app in apps {
