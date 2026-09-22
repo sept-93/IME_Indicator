@@ -1,6 +1,7 @@
 //! 焦点上下文感知输入法切换。
 //! 只在上下文稳定且发生变化时切换一次，保留用户在当前输入框内的手动选择。
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -53,8 +54,7 @@ pub struct AutoSwitcher {
     candidate_since: Instant,
     applied_context: Option<SwitchContextKey>,
     enabled_last: bool,
-    last_switch_attempt: Instant,
-    target_retry_used: bool,
+    adobe_editable_processes: HashSet<u32>,
 }
 
 impl AutoSwitcher {
@@ -64,12 +64,11 @@ impl AutoSwitcher {
             candidate_since: Instant::now(),
             applied_context: None,
             enabled_last: crate::tray::smart_switch_enabled(),
-            last_switch_attempt: Instant::now(),
-            target_retry_used: false,
+            adobe_editable_processes: HashSet::new(),
         }
     }
 
-    pub fn observe(&mut self, context: FocusContext, chinese_mode: bool) {
+    pub fn observe(&mut self, context: FocusContext, _chinese_mode: bool) {
         let enabled = crate::tray::smart_switch_enabled();
         if !enabled {
             self.enabled_last = false;
@@ -89,7 +88,6 @@ impl AutoSwitcher {
         if changed {
             self.candidate = Some(context);
             self.candidate_since = Instant::now();
-            self.target_retry_used = false;
             // 输入框和搜索框优先响应：一旦检测到 Caret/Edit/Document 焦点，
             // 本轮立即切换。非输入区仍保留短暂防抖，避免切窗口时闪动。
             if !self
@@ -116,57 +114,56 @@ impl AutoSwitcher {
         };
         let context_key = SwitchContextKey::from(context);
         let process_name = process_name(context.process_id).unwrap_or_default();
-        // C4D 必须彻底绕过自动切换，即使旧配置里曾保存过 auto/chinese/english，
-        // 也不能向其自绘消息循环发送跨进程输入语言消息。
-        let rule = if process_name.eq_ignore_ascii_case("Cinema 4D.exe") {
+        // C4D、剪映和 CapCut 只显示用户手动切换后的状态；即使旧配置曾保存
+        // auto/chinese/english，也不向这些自绘消息循环发送输入语言消息。
+        let rule = if is_indicator_only_process(&process_name) {
             "ignore"
         } else {
             crate::config::auto_switch_app_rule(&process_name)
                 .unwrap_or_else(|| default_rule_for_process(&process_name))
         };
+
+        // Adobe 的 auto 模式在启动窗口阶段不接收跨进程语言消息。只有该进程
+        // 确实进入过文字编辑后，才在退出编辑时发一次英文切换。显式设置的
+        // 固定中文/英文规则仍然按用户选择执行。
+        if rule == "auto" && is_adobe_design_process(&process_name) {
+            if context.editable {
+                self.adobe_editable_processes.insert(context.process_id);
+            } else if !self.adobe_editable_processes.contains(&context.process_id) {
+                return;
+            }
+        }
+
         let Some(target) = target_for(rule, context.password, context.editable) else {
             return;
         };
 
-        let already_applied = self.applied_context.as_ref() == Some(&context_key);
-        if already_applied
-            && !should_retry_target(
-                target,
-                chinese_mode,
-                self.target_retry_used,
-                self.last_switch_attempt.elapsed(),
-            )
-        {
+        if self.applied_context.as_ref() == Some(&context_key) {
             return;
         }
 
-        if already_applied {
-            self.target_retry_used = true;
-        } else {
-            self.applied_context = Some(context_key);
-        }
+        // 每个上下文只自动切换一次。不能在 250ms 后补切，否则用户手动切成
+        // 英文时会被程序抢回中文，表现为必须按两次中英文快捷键。
+        self.applied_context = Some(context_key);
 
         let _ = switch_language(context.focused_hwnd, context.foreground_hwnd, target);
-        self.last_switch_attempt = Instant::now();
     }
 }
 
-fn should_retry_target(
-    target: LanguageTarget,
-    chinese_mode: bool,
-    retry_used: bool,
-    elapsed: Duration,
-) -> bool {
-    let state_mismatch = match target {
-        LanguageTarget::Chinese => !chinese_mode,
-        LanguageTarget::English => chinese_mode,
-    };
-    state_mismatch && !retry_used && elapsed >= Duration::from_millis(250)
+fn is_indicator_only_process(process_name: &str) -> bool {
+    ["Cinema 4D.exe", "JianyingPro.exe", "CapCut.exe"]
+        .iter()
+        .any(|candidate| process_name.eq_ignore_ascii_case(candidate))
+}
+
+fn is_adobe_design_process(process_name: &str) -> bool {
+    ["Photoshop.exe", "Illustrator.exe"]
+        .iter()
+        .any(|candidate| process_name.eq_ignore_ascii_case(candidate))
 }
 
 fn default_rule_for_process(process_name: &str) -> &'static str {
-    // C4D 完全不接收自动切换消息；只由主循环读取系统 IME 状态并显示提示。
-    if process_name.eq_ignore_ascii_case("Cinema 4D.exe") {
+    if is_indicator_only_process(process_name) {
         "ignore"
     } else {
         "auto"
@@ -276,10 +273,9 @@ fn send_ime_control(hwnd: HWND, command: usize, value: isize) {
 mod tests {
     use windows::Win32::Foundation::HWND;
 
-    use std::time::Duration;
-
     use super::{
-        default_rule_for_process, should_retry_target, target_for, LanguageTarget, SwitchContextKey,
+        default_rule_for_process, is_indicator_only_process, target_for, LanguageTarget,
+        SwitchContextKey,
     };
     use crate::caret_detector::FocusContext;
 
@@ -326,8 +322,11 @@ mod tests {
     }
 
     #[test]
-    fn cinema_4d_is_indicator_only_by_default() {
+    fn sensitive_video_and_3d_apps_are_indicator_only_by_default() {
         assert_eq!(default_rule_for_process("Cinema 4D.exe"), "ignore");
+        assert_eq!(default_rule_for_process("JianyingPro.exe"), "ignore");
+        assert_eq!(default_rule_for_process("CapCut.exe"), "ignore");
+        assert!(is_indicator_only_process("capcut.EXE"));
         assert_eq!(default_rule_for_process("Photoshop.exe"), "auto");
         assert_eq!(target_for("ignore", false, false), None);
         assert_eq!(target_for("ignore", false, true), None);
@@ -346,33 +345,5 @@ mod tests {
             SwitchContextKey::from(&input),
             SwitchContextKey::from(&input)
         );
-    }
-
-    #[test]
-    fn mismatched_target_gets_only_one_delayed_correction() {
-        assert!(should_retry_target(
-            LanguageTarget::English,
-            true,
-            false,
-            Duration::from_millis(300)
-        ));
-        assert!(!should_retry_target(
-            LanguageTarget::English,
-            true,
-            true,
-            Duration::from_secs(1)
-        ));
-        assert!(should_retry_target(
-            LanguageTarget::Chinese,
-            false,
-            false,
-            Duration::from_secs(1)
-        ));
-        assert!(!should_retry_target(
-            LanguageTarget::Chinese,
-            true,
-            false,
-            Duration::from_secs(1)
-        ));
     }
 }

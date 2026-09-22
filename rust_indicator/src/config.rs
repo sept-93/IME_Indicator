@@ -440,7 +440,7 @@ enable = true               # 是否按焦点上下文自动切换输入法
 chinese_klid = "00000804"  # 当前系统启用的简体中文输入法
 english_klid = "00000409"  # 英语（美国）键盘
 settle_ms = 80              # 焦点稳定多久后切换；低于一次状态轮询可在下一轮立即响应
-# 按进程名覆盖默认行为，可选 auto/chinese/english/ignore；规则只在上下文变化时执行一次
+# 按进程名覆盖默认行为：auto 自动识别；chinese/english 固定语言；ignore 仅显示状态且不探测
 # app_rules = ["WindowsTerminal.exe=english", "Obsidian.exe=chinese", "game.exe=ignore"]
 app_rules = []
 # 自定义补充：应用有真实文字光标、但输入区无法自动识别时，在此填写 EXE 文件名；修改后重启

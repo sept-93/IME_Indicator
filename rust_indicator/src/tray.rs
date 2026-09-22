@@ -4,8 +4,8 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{
     CreateFontW, DeleteObject, GetSysColorBrush, SetBkMode, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
-    COLOR_WINDOW, DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, HBRUSH, HDC,
-    HFONT, OUT_DEFAULT_PRECIS, TRANSPARENT,
+    COLOR_WINDOW, DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, HBRUSH, HDC, HFONT,
+    OUT_DEFAULT_PRECIS, TRANSPARENT,
 };
 use windows::Win32::Graphics::GdiPlus::{
     GdipCreateBitmapFromFile, GdipCreateHICONFromBitmap, GdipDisposeImage,
@@ -22,7 +22,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Controls::{
     ImageList_Create, ImageList_Destroy, ImageList_ReplaceIcon, ImageList_SetBkColor,
-    InitCommonControlsEx, CLR_NONE, HIMAGELIST, ICC_LISTVIEW_CLASSES, ILC_COLOR32,
+    InitCommonControlsEx, CLR_NONE, HIMAGELIST, ICC_LISTVIEW_CLASSES, ILC_COLOR32, ILC_MASK,
     INITCOMMONCONTROLSEX, LVCF_WIDTH, LVCOLUMNW, LVIF_IMAGE, LVIF_TEXT, LVITEMW,
     LVM_DELETEALLITEMS, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
     LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST, LVNI_SELECTED, LVSIL_SMALL,
@@ -63,6 +63,14 @@ const IDC_APP_LIST: u32 = 2001;
 const IDC_SAVE_RULE: u32 = 2003;
 const IDC_REFRESH_APPS: u32 = 2004;
 const IDC_RULE_FIRST: u32 = 2100;
+const APP_RULE_LABELS: [&str; 5] = [
+    "自动识别输入框",
+    "固定中文",
+    "固定英文",
+    "删除自定义规则",
+    "仅显示状态",
+];
+const APP_RULE_MODES: [&str; 5] = ["auto", "chinese", "english", "remove", "ignore"];
 const STARTUP_VALUE_NAME: windows::core::PCWSTR = w!("IME Indicator");
 const STARTUP_RUN_KEY: windows::core::PCWSTR =
     w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -620,13 +628,6 @@ fn show_app_rule_editor() {
         );
 
         let mut rule_buttons = Vec::new();
-        let rule_labels = [
-            "自动识别输入框",
-            "固定中文",
-            "固定英文",
-            "忽略此应用",
-            "删除自定义规则",
-        ];
         let positions = [
             (16, 372, 135),
             (151, 372, 105),
@@ -634,7 +635,7 @@ fn show_app_rule_editor() {
             (16, 394, 120),
             (136, 394, 150),
         ];
-        for (index, label) in rule_labels.iter().enumerate() {
+        for (index, label) in APP_RULE_LABELS.iter().enumerate() {
             let group = if index == 0 {
                 WS_GROUP
             } else {
@@ -703,7 +704,7 @@ fn show_app_rule_editor() {
         let _ = CreateWindowExW(
             Default::default(),
             w!("STATIC"),
-            w!("提示：自动识别仅补充输入框检测。"),
+            w!("提示：仅显示状态不会自动切换或探测控件。"),
             WS_CHILD | WS_VISIBLE,
             16,
             470,
@@ -718,7 +719,7 @@ fn show_app_rule_editor() {
         // 未显式设置字体时，原生 LISTBOX/COMBOBOX 会退回难看的等宽系统字体。
         // 给全部子控件统一使用 Windows 默认界面字体，并立即重绘。
         let font = create_ui_font(-12, FW_NORMAL.0 as i32);
-        let title_font = create_ui_font(-16, FW_SEMIBOLD.0 as i32);
+        let title_font = create_ui_font(-13, FW_NORMAL.0 as i32);
         let _ = EnumChildWindows(hwnd, Some(set_default_gui_font), LPARAM(font.0 as isize));
         if let Some(header) = header {
             let _ = SendMessageW(header, WM_SETFONT, WPARAM(title_font.0 as usize), LPARAM(1));
@@ -877,10 +878,7 @@ fn save_selected_app_rule() {
         show_error("请先选择一个应用和规则。");
         return;
     };
-    let mode = ["auto", "chinese", "english", "ignore", "remove"]
-        .get(rule_index)
-        .copied()
-        .unwrap_or("auto");
+    let mode = APP_RULE_MODES.get(rule_index).copied().unwrap_or("auto");
     if let Err(error) = crate::config::update_application_setting(&app, mode) {
         show_error(&format!("保存应用规则失败：\n{}", error));
         return;
@@ -973,7 +971,7 @@ fn process_info_from_id(process_id: u32) -> Option<(String, PathBuf)> {
 }
 
 unsafe fn create_app_image_list(apps: &[RunningApp]) -> (Option<HIMAGELIST>, Vec<i32>) {
-    let images = ImageList_Create(28, 28, ILC_COLOR32, apps.len().max(1) as i32, 4);
+    let images = ImageList_Create(28, 28, ILC_COLOR32 | ILC_MASK, apps.len().max(1) as i32, 4);
     if images.0 == 0 {
         return (None, vec![-1; apps.len()]);
     }
@@ -1064,7 +1062,15 @@ fn restart_app() {
 
 #[cfg(test)]
 mod tests {
-    use super::process_display_name;
+    use super::{process_display_name, APP_RULE_LABELS, APP_RULE_MODES};
+
+    #[test]
+    fn destructive_and_indicator_only_rules_have_matching_positions() {
+        assert_eq!(APP_RULE_LABELS[3], "删除自定义规则");
+        assert_eq!(APP_RULE_MODES[3], "remove");
+        assert_eq!(APP_RULE_LABELS[4], "仅显示状态");
+        assert_eq!(APP_RULE_MODES[4], "ignore");
+    }
 
     #[test]
     fn application_list_uses_only_the_executable_name() {

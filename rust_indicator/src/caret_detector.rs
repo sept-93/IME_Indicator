@@ -44,6 +44,8 @@ const CARET_FAST_PATH_APPS: &[&str] = &[
     "Photoshop.exe",
     "Illustrator.exe",
     "Cinema 4D.exe",
+    "JianyingPro.exe",
+    "CapCut.exe",
     "SearchHost.exe",
     "SearchApp.exe",
     "StartMenuExperienceHost.exe",
@@ -56,8 +58,8 @@ const CARET_FAST_PATH_APPS: &[&str] = &[
 ];
 
 /// 对这些应用不做 Caret/MSAA/UIA 或应用内编辑模式探测，只读取系统 IME 状态。
-/// Cinema 4D 的自绘消息循环对跨进程辅助功能查询非常敏感，频繁探测会造成卡顿。
-const INDICATOR_ONLY_APPS: &[&str] = &["Cinema 4D.exe"];
+/// 这些自绘消息循环对跨进程辅助功能查询敏感，只读取系统输入法状态。
+const INDICATOR_ONLY_APPS: &[&str] = &["Cinema 4D.exe", "JianyingPro.exe", "CapCut.exe"];
 
 /// 浏览器和富文本应用常把真正的编辑区暴露为 Custom/Text/Group，而不是标准 Edit。
 /// 仅对这些已验证应用允许用当前线程的真实 Caret 补足 UIA，避免重新放宽到所有
@@ -80,6 +82,10 @@ const CARET_COMPAT_APPS: &[&str] = &[
 /// Photoshop/Illustrator 的画布文字光标完全由应用绘制，Windows 没有 Caret 对象。
 /// 在这些应用内按 T 进入文字工具后进入兼容输入模式，Esc 或 Ctrl+Enter 退出。
 const DESIGN_TEXT_SHORTCUT_APPS: &[&str] = &["Photoshop.exe", "Illustrator.exe"];
+
+/// Adobe 设计软件的启动/画布窗口不接受 MSAA 探测；原生重命名框只用
+/// GetGUIThreadInfo，画布文字则由应用专用状态机识别。
+const GUI_ONLY_CARET_APPS: &[&str] = &["Photoshop.exe", "Illustrator.exe"];
 
 /// WPS 与 Microsoft Office 的文档/表格画布经常不公开标准 Edit 控件。
 const OFFICE_EDIT_APPS: &[&str] = &[
@@ -252,6 +258,18 @@ impl CaretDetector {
                 format!("{}:{}", foreground_hwnd.0 as usize, focused_hwnd.0 as usize);
 
             let process_name = process_name(process_id).unwrap_or_default();
+            if process_is_indicator_only(&process_name) {
+                return FocusContext {
+                    identity: fallback_identity,
+                    foreground_hwnd,
+                    focused_hwnd,
+                    process_id,
+                    editable: false,
+                    password: false,
+                    readonly_document: false,
+                    force_mouse_indicator: false,
+                };
+            }
             let special_edit_mode =
                 self.update_application_edit_mode(&process_name, process_id, has_caret);
 
@@ -500,6 +518,20 @@ impl CaretDetector {
                 self.pending_design_native = None;
                 self.last_left_click = None;
                 return false;
+            } else if left_pressed && !double_click && was_canvas_active {
+                let expected = self.design_text_cursor_handles.get(&process_id).copied();
+                let current = crate::cursor_detector::current_cursor_handle();
+                if standard_arrow
+                    || (expected.is_some() && current.is_some() && expected != current)
+                {
+                    // 双击已有文字进入编辑后，点击文字光标之外的区域立即退出。
+                    self.design_text_processes.remove(&process_id);
+                    self.design_native_processes.remove(&process_id);
+                    self.design_caret_suppressed.insert(process_id);
+                    self.pending_design_tool_check = None;
+                    self.last_left_click = None;
+                    return false;
+                }
             } else if t_pressed && !has_caret {
                 // T 只选择文字工具；等用户真正点击画布文字位置后才进入中文。
                 self.design_text_tools.insert(process_id);
@@ -638,9 +670,19 @@ impl CaretDetector {
 
     /// 多级检测：按配置的 methods 顺序依次尝试
     fn detect(&mut self) -> Option<CaretPos> {
-        if foreground_process_matches(INDICATOR_ONLY_APPS) {
+        let foreground_process = foreground_process_name().unwrap_or_default();
+        if process_is_indicator_only(&foreground_process) {
             self.last_source = DetectionSource::None;
             return None;
+        }
+        if process_matches(&foreground_process, GUI_ONLY_CARET_APPS) {
+            let pos = self.get_pos_via_gui_info();
+            self.last_source = if pos.is_some() {
+                DetectionSource::GuiInfo
+            } else {
+                DetectionSource::None
+            };
+            return pos;
         }
         for name in crate::config::caret_methods() {
             let Some(method) = DetectionSource::from_name(name) else {
@@ -766,13 +808,18 @@ impl CaretDetector {
     }
 }
 
-fn foreground_process_matches(candidates: &[&str]) -> bool {
+fn foreground_process_name() -> Option<String> {
     unsafe {
         let hwnd = GetForegroundWindow();
         let mut process_id = 0u32;
         GetWindowThreadProcessId(hwnd, Some(&mut process_id));
-        process_name(process_id).is_some_and(|name| process_matches(&name, candidates))
+        process_name(process_id)
     }
+}
+
+fn process_is_indicator_only(process_name: &str) -> bool {
+    process_matches(process_name, INDICATOR_ONLY_APPS)
+        || crate::config::auto_switch_app_rule(process_name) == Some("ignore")
 }
 
 fn process_matches(process_name: &str, candidates: &[&str]) -> bool {
@@ -814,7 +861,7 @@ fn process_name(process_id: u32) -> Option<String> {
 mod tests {
     use super::{
         process_matches, CARET_COMPAT_APPS, CARET_FAST_PATH_APPS, DESIGN_TEXT_SHORTCUT_APPS,
-        INDICATOR_ONLY_APPS, OFFICE_EDIT_APPS, OFFICE_SPREADSHEET_APPS,
+        GUI_ONLY_CARET_APPS, INDICATOR_ONLY_APPS, OFFICE_EDIT_APPS, OFFICE_SPREADSHEET_APPS,
     };
 
     #[test]
@@ -850,9 +897,13 @@ mod tests {
         ));
         assert!(!process_matches("Cinema 4D.exe", DESIGN_TEXT_SHORTCUT_APPS));
         assert!(process_matches("Cinema 4D.exe", INDICATOR_ONLY_APPS));
+        assert!(process_matches("JianyingPro.exe", INDICATOR_ONLY_APPS));
+        assert!(process_matches("CapCut.exe", INDICATOR_ONLY_APPS));
         assert!(process_matches("Photoshop.exe", CARET_FAST_PATH_APPS));
         assert!(process_matches("Illustrator.exe", CARET_FAST_PATH_APPS));
         assert!(process_matches("Cinema 4D.exe", CARET_FAST_PATH_APPS));
+        assert!(process_matches("Photoshop.exe", GUI_ONLY_CARET_APPS));
+        assert!(process_matches("Illustrator.exe", GUI_ONLY_CARET_APPS));
     }
 
     #[test]
