@@ -2,6 +2,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, PWSTR};
@@ -89,6 +92,33 @@ const OFFICE_EDIT_APPS: &[&str] = &[
 ];
 
 const OFFICE_SPREADSHEET_APPS: &[&str] = &["et.exe", "EXCEL.EXE"];
+
+// UIA/IME 查询偶尔会让主检测循环停顿几十到数百毫秒。单独锁存 Esc 的
+// 按下沿，避免 Photoshop/Illustrator 已经退出文字编辑，但主循环漏掉按键。
+static ESCAPE_LATCHED: AtomicBool = AtomicBool::new(false);
+static ESCAPE_WATCHER_STARTED: AtomicBool = AtomicBool::new(false);
+
+pub fn start_escape_watcher(running: Arc<AtomicBool>) {
+    if ESCAPE_WATCHER_STARTED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+
+    thread::spawn(move || {
+        let mut was_down = false;
+        while running.load(Ordering::SeqCst) {
+            let down = unsafe { (GetAsyncKeyState(VK_ESCAPE.0 as i32) as u16 & 0x8000) != 0 };
+            if down && !was_down {
+                ESCAPE_LATCHED.store(true, Ordering::SeqCst);
+            }
+            was_down = down;
+            thread::sleep(Duration::from_millis(5));
+        }
+        ESCAPE_WATCHER_STARTED.store(false, Ordering::SeqCst);
+    });
+}
 
 // ============================================================================
 // 类型定义
@@ -360,7 +390,9 @@ impl CaretDetector {
         // 刚好落在两次 30ms 轮询之间，造成 Illustrator 偶发无法进入或退出。
         let t_pressed = t_since_last || (t_now && !self.t_down);
         let b_pressed = b_since_last || (b_now && !self.b_down);
-        let escape_pressed = escape_since_last || (escape_now && !self.escape_down);
+        let escape_pressed = ESCAPE_LATCHED.swap(false, Ordering::SeqCst)
+            || escape_since_last
+            || (escape_now && !self.escape_down);
         let enter_pressed = enter_since_last || (enter_now && !self.enter_down);
         let left_pressed = left_since_last || (left_now && !self.left_down);
         let v_pressed = v_since_last || (v_now && !self.v_down);
@@ -457,6 +489,16 @@ impl CaretDetector {
                 // 图层/对象重命名使用 Enter 提交；画布多行文字中的 Enter 不退出。
                 self.design_native_processes.remove(&process_id);
                 self.design_caret_suppressed.insert(process_id);
+                return false;
+            } else if left_pressed && !double_click && was_native_active {
+                // Photoshop 图层名/Illustrator 对象名的原生编辑框在失焦后仍可能
+                // 暂留一帧 Caret。任何下一次单击都已经提交重命名，必须先结束
+                // 中文输入态，不能再让下方的 has_caret 分支把它重新激活。
+                self.design_text_processes.remove(&process_id);
+                self.design_native_processes.remove(&process_id);
+                self.design_caret_suppressed.insert(process_id);
+                self.pending_design_native = None;
+                self.last_left_click = None;
                 return false;
             } else if t_pressed && !has_caret {
                 // T 只选择文字工具；等用户真正点击画布文字位置后才进入中文。

@@ -105,6 +105,8 @@ fn main() {
 }
 
 fn run_detector_loop(running: Arc<AtomicBool>) {
+    caret_detector::start_escape_watcher(running.clone());
+
     // 初始化检测器
     let mut caret_detector = CaretDetector::new();
     let mut auto_switcher = AutoSwitcher::new();

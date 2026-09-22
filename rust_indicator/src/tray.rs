@@ -559,7 +559,7 @@ fn show_app_rule_editor() {
             WS_CHILD | WS_VISIBLE,
             16,
             35,
-            368,
+            352,
             20,
             hwnd,
             None,
@@ -576,7 +576,7 @@ fn show_app_rule_editor() {
                 | WINDOW_STYLE(LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOCOLUMNHEADER),
             16,
             58,
-            368,
+            352,
             285,
             hwnd,
             HMENU(IDC_APP_LIST as usize as *mut _),
@@ -589,7 +589,7 @@ fn show_app_rule_editor() {
         };
         let column = LVCOLUMNW {
             mask: LVCF_WIDTH,
-            cx: 344,
+            cx: 328,
             ..Default::default()
         };
         let _ = SendMessageW(
@@ -610,9 +610,9 @@ fn show_app_rule_editor() {
             w!("处理方式"),
             WS_CHILD | WS_VISIBLE,
             16,
-            348,
+            356,
             120,
-            22,
+            18,
             hwnd,
             None,
             h_instance,
@@ -631,8 +631,8 @@ fn show_app_rule_editor() {
             (16, 372, 135),
             (151, 372, 105),
             (256, 372, 105),
-            (16, 398, 120),
-            (136, 398, 150),
+            (16, 394, 120),
+            (136, 394, 150),
         ];
         for (index, label) in rule_labels.iter().enumerate() {
             let group = if index == 0 {
@@ -677,8 +677,8 @@ fn show_app_rule_editor() {
             w!("BUTTON"),
             w!("刷新列表"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            174,
-            430,
+            160,
+            426,
             96,
             32,
             hwnd,
@@ -691,9 +691,9 @@ fn show_app_rule_editor() {
             w!("BUTTON"),
             w!("保存并应用"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
-            276,
-            430,
-            108,
+            264,
+            426,
+            104,
             32,
             hwnd,
             HMENU(IDC_SAVE_RULE as usize as *mut _),
@@ -707,7 +707,7 @@ fn show_app_rule_editor() {
             WS_CHILD | WS_VISIBLE,
             16,
             470,
-            368,
+            352,
             18,
             hwnd,
             None,
