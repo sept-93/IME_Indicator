@@ -26,6 +26,7 @@ const INPUTLANGCHANGE_SYSCHARSET: usize = 0x0001;
 const ADOBE_ENGLISH_RETRY_MS: u64 = 120;
 const EDITABLE_ENTRY_RETRY_WINDOW_MS: u64 = 260;
 const EDITABLE_ENTRY_RETRY_INTERVAL_MS: u64 = 70;
+const DOUBLE_CLICK_HOLD_MS: u64 = 1500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LanguageTarget {
@@ -61,6 +62,7 @@ pub struct AutoSwitcher {
     adobe_english_attempts: HashMap<u32, Instant>,
     editable_entry: Option<(SwitchContextKey, Instant)>,
     editable_entry_last_attempt: Option<Instant>,
+    manual_double_click_hold: Option<(u32, HWND, Instant)>,
 }
 
 impl AutoSwitcher {
@@ -74,6 +76,7 @@ impl AutoSwitcher {
             adobe_english_attempts: HashMap::new(),
             editable_entry: None,
             editable_entry_last_attempt: None,
+            manual_double_click_hold: None,
         }
     }
 
@@ -83,6 +86,7 @@ impl AutoSwitcher {
             self.enabled_last = false;
             self.editable_entry = None;
             self.editable_entry_last_attempt = None;
+            self.manual_double_click_hold = None;
             return;
         }
         if !self.enabled_last {
@@ -90,7 +94,12 @@ impl AutoSwitcher {
             self.applied_context = None;
             self.editable_entry = None;
             self.editable_entry_last_attempt = None;
+            self.manual_double_click_hold = None;
             self.enabled_last = true;
+        }
+
+        if !context.editable {
+            self.manual_double_click_hold = None;
         }
 
         let next_key = SwitchContextKey::from(&context);
@@ -160,6 +169,43 @@ impl AutoSwitcher {
             return;
         };
 
+        if rule == "auto"
+            && context.input_double_click
+            && context.editable
+            && !context.password
+            && supports_double_click_toggle(&process_name)
+        {
+            // 双击是独立的手动覆盖：严格按本轮检测到的真实输入法状态反转，
+            // 并取消“进入输入框补切中文”，避免随后单击定位时又被自动规则覆盖。
+            let manual_target = double_click_target(chinese_mode);
+            self.applied_context = Some(context_key);
+            self.editable_entry = None;
+            self.editable_entry_last_attempt = None;
+            self.manual_double_click_hold =
+                Some((context.process_id, context.focused_hwnd, Instant::now()));
+            let _ = switch_language(context.focused_hwnd, context.foreground_hwnd, manual_target);
+            return;
+        }
+
+        let hold_manual_mode =
+            self.manual_double_click_hold
+                .is_some_and(|(process_id, focused_hwnd, started)| {
+                    process_id == context.process_id
+                        && focused_hwnd == context.focused_hwnd
+                        && started.elapsed() <= Duration::from_millis(DOUBLE_CLICK_HOLD_MS)
+                });
+        if hold_manual_mode && rule == "auto" && context.editable {
+            // 标准输入框双击通常会先选中单词，用户随后还会单击放置插入点。
+            // 这段短保护只阻止该后续点击重新触发默认中文，不再发送语言命令。
+            self.applied_context = Some(context_key);
+            self.editable_entry = None;
+            self.editable_entry_last_attempt = None;
+            return;
+        }
+        if self.manual_double_click_hold.is_some() && !hold_manual_mode {
+            self.manual_double_click_hold = None;
+        }
+
         if chinese_mode
             && self
                 .editable_entry
@@ -222,6 +268,33 @@ fn is_adobe_design_process(process_name: &str) -> bool {
     ["Photoshop.exe", "Illustrator.exe"]
         .iter()
         .any(|candidate| process_name.eq_ignore_ascii_case(candidate))
+}
+
+fn is_office_edit_process(process_name: &str) -> bool {
+    [
+        "wps.exe",
+        "et.exe",
+        "wpp.exe",
+        "WINWORD.EXE",
+        "EXCEL.EXE",
+        "POWERPNT.EXE",
+    ]
+    .iter()
+    .any(|candidate| process_name.eq_ignore_ascii_case(candidate))
+}
+
+fn supports_double_click_toggle(process_name: &str) -> bool {
+    !is_indicator_only_process(process_name)
+        && !is_adobe_design_process(process_name)
+        && !is_office_edit_process(process_name)
+}
+
+fn double_click_target(chinese_mode: bool) -> LanguageTarget {
+    if chinese_mode {
+        LanguageTarget::English
+    } else {
+        LanguageTarget::Chinese
+    }
 }
 
 fn should_enforce_adobe_english(
@@ -386,9 +459,9 @@ mod tests {
     use windows::Win32::Foundation::HWND;
 
     use super::{
-        default_rule_for_process, ime_open_status_for_target, is_indicator_only_process,
-        should_enforce_adobe_english, should_retry_editable_chinese, target_for, LanguageTarget,
-        SwitchContextKey,
+        default_rule_for_process, double_click_target, ime_open_status_for_target,
+        is_indicator_only_process, should_enforce_adobe_english, should_retry_editable_chinese,
+        supports_double_click_toggle, target_for, LanguageTarget, SwitchContextKey,
     };
     use crate::caret_detector::FocusContext;
 
@@ -402,6 +475,7 @@ mod tests {
             password,
             readonly_document: false,
             force_mouse_indicator: false,
+            input_double_click: false,
         }
     }
 
@@ -484,6 +558,20 @@ mod tests {
     }
 
     #[test]
+    fn double_click_toggle_uses_current_mode_and_skips_conflicting_apps() {
+        assert_eq!(double_click_target(true), LanguageTarget::English);
+        assert_eq!(double_click_target(false), LanguageTarget::Chinese);
+        assert!(supports_double_click_toggle("Weixin.exe"));
+        assert!(supports_double_click_toggle("WXWork.exe"));
+        assert!(supports_double_click_toggle("chrome.exe"));
+        assert!(!supports_double_click_toggle("Photoshop.exe"));
+        assert!(!supports_double_click_toggle("Illustrator.exe"));
+        assert!(!supports_double_click_toggle("et.exe"));
+        assert!(!supports_double_click_toggle("WINWORD.EXE"));
+        assert!(!supports_double_click_toggle("JianyingPro.exe"));
+    }
+
+    #[test]
     fn sensitive_video_and_3d_apps_are_indicator_only_by_default() {
         assert_eq!(default_rule_for_process("Cinema 4D.exe"), "ignore");
         assert_eq!(default_rule_for_process("JianyingPro.exe"), "ignore");
@@ -498,6 +586,8 @@ mod tests {
     fn editable_state_changes_context_for_custom_drawn_apps() {
         let non_input = context(false, false);
         let input = context(true, false);
+        let mut double_clicked_input = input.clone();
+        double_clicked_input.input_double_click = true;
 
         assert_ne!(
             SwitchContextKey::from(&non_input),
@@ -506,6 +596,10 @@ mod tests {
         assert_eq!(
             SwitchContextKey::from(&input),
             SwitchContextKey::from(&input)
+        );
+        assert_eq!(
+            SwitchContextKey::from(&input),
+            SwitchContextKey::from(&double_clicked_input)
         );
     }
 }

@@ -22,7 +22,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_LBUTTON, VK_RETURN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
+    GetClassNameW, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
+    GUITHREADINFO,
 };
 
 // ============================================================================
@@ -195,6 +196,7 @@ pub struct FocusContext {
     pub password: bool,
     pub readonly_document: bool,
     pub force_mouse_indicator: bool,
+    pub input_double_click: bool,
 }
 
 /// 检测来源
@@ -242,6 +244,7 @@ pub struct CaretDetector {
     left_down: bool,
     v_down: bool,
     last_left_click: Option<(Instant, u32, i32, i32)>,
+    input_double_click: bool,
 }
 
 impl CaretDetector {
@@ -277,6 +280,7 @@ impl CaretDetector {
             left_down: false,
             v_down: false,
             last_left_click: None,
+            input_double_click: false,
         }
     }
 
@@ -318,10 +322,17 @@ impl CaretDetector {
                     password: false,
                     readonly_document: false,
                     force_mouse_indicator: false,
+                    input_double_click: false,
                 };
             }
-            let special_edit_mode =
-                self.update_application_edit_mode(&process_name, process_id, has_caret);
+            let special_edit_mode = self.update_application_edit_mode(
+                &process_name,
+                process_id,
+                has_caret,
+                focused_hwnd,
+                gui_info.hwndCaret,
+            );
+            let input_double_click = self.input_double_click;
 
             // 微信等自绘应用的 UIA GetFocusedElement 会卡住约 3 秒，并且最终只返回
             // 顶层窗口。Win32/MSAA Caret 已能可靠反映聊天框和搜索框是否可输入。
@@ -342,6 +353,7 @@ impl CaretDetector {
                     password: false,
                     readonly_document: false,
                     force_mouse_indicator: special_edit_mode && !has_caret,
+                    input_double_click,
                 };
             }
 
@@ -355,6 +367,7 @@ impl CaretDetector {
                     password: false,
                     readonly_document: false,
                     force_mouse_indicator: special_edit_mode && !has_caret,
+                    input_double_click,
                 };
             };
             let Ok(focused) = automation.GetFocusedElement() else {
@@ -367,6 +380,7 @@ impl CaretDetector {
                     password: false,
                     readonly_document: false,
                     force_mouse_indicator: special_edit_mode && !has_caret,
+                    input_double_click,
                 };
             };
 
@@ -436,6 +450,7 @@ impl CaretDetector {
                 password,
                 readonly_document,
                 force_mouse_indicator: special_edit_mode && !has_caret,
+                input_double_click,
             }
         }
     }
@@ -445,7 +460,10 @@ impl CaretDetector {
         process_name: &str,
         process_id: u32,
         has_caret: bool,
+        focused_hwnd: HWND,
+        caret_hwnd: HWND,
     ) -> bool {
+        self.input_double_click = false;
         let (t_now, t_since_last) = key_sample(0x54); // T
         let (b_now, b_since_last) = key_sample(0x42); // B
         let (escape_now, escape_since_last) = key_sample(VK_ESCAPE.0 as i32);
@@ -507,7 +525,15 @@ impl CaretDetector {
             }
             self.last_left_click = Some((sample.at, sample.process_id, sample.x, sample.y));
         }
+        if double_click {
+            // 一次双击只消费成一个切换事件。第二击不再作为下一次双击的首击，
+            // 避免选中文字后紧接着单击定位时又反向切换。
+            self.last_left_click = None;
+        }
+        self.input_double_click = double_click;
         let standard_arrow = left_pressed && crate::cursor_detector::is_standard_arrow_cursor();
+        let native_edit_focus = has_caret
+            && (window_class_is_edit_like(focused_hwnd) || window_class_is_edit_like(caret_hwnd));
 
         if process_matches(process_name, DESIGN_TEXT_SHORTCUT_APPS) {
             self.office_edit_processes.clear();
@@ -578,7 +604,7 @@ impl CaretDetector {
                 self.design_text_cursor_handles.remove(&process_id);
                 self.design_caret_suppressed.insert(process_id);
                 return false;
-            } else if left_pressed && !double_click && was_native_active {
+            } else if left_pressed && !double_click && was_native_active && !native_edit_focus {
                 // Photoshop 图层名/Illustrator 对象名的原生编辑框在失焦后仍可能
                 // 暂留一帧 Caret。任何下一次单击都已经提交重命名，必须先结束
                 // 中文输入态，不能再让下方的 has_caret 分支把它重新激活。
@@ -591,12 +617,9 @@ impl CaretDetector {
                 self.last_left_click = None;
                 return false;
             } else if left_pressed && !double_click && was_canvas_active {
-                let expected = self.design_text_cursor_handles.get(&process_id).copied();
-                let current = crate::cursor_detector::current_cursor_handle();
-                if standard_arrow
-                    || (expected.is_some() && current.is_some() && expected != current)
-                {
-                    // 双击已有文字进入编辑后，点击文字光标之外的区域立即退出。
+                if standard_arrow {
+                    // Photoshop 在同一段文字内不同位置会切换多种文字光标句柄，
+                    // 不能再把句柄变化当作退出；只有明确点到普通箭头区域才退出。
                     self.design_text_processes.remove(&process_id);
                     self.design_text_tools.remove(&process_id);
                     self.design_native_processes.remove(&process_id);
@@ -617,6 +640,18 @@ impl CaretDetector {
                 self.design_caret_suppressed.insert(process_id);
             } else if was_canvas_active && (b_pressed || v_pressed) {
                 self.pending_design_tool_check = Some((process_id, Instant::now()));
+            }
+
+            if native_edit_focus {
+                // Photoshop/Illustrator 的搜索框和原生名称编辑框会暴露真实
+                // Edit/RichEdit/Search Caret。即使画布编辑刚留下抑制标记，
+                // 点击这类明确输入控件仍应立即进入中文。
+                self.design_text_processes.remove(&process_id);
+                self.design_text_tools.remove(&process_id);
+                self.design_caret_suppressed.remove(&process_id);
+                self.design_native_processes.insert(process_id);
+                self.pending_design_native = None;
+                return true;
             }
 
             if left_pressed {
@@ -893,6 +928,19 @@ fn process_matches(process_name: &str, candidates: &[&str]) -> bool {
     candidates
         .iter()
         .any(|candidate| process_name.eq_ignore_ascii_case(candidate))
+}
+
+fn window_class_is_edit_like(hwnd: HWND) -> bool {
+    if hwnd.0.is_null() {
+        return false;
+    }
+    let mut buffer = [0u16; 128];
+    let len = unsafe { GetClassNameW(hwnd, &mut buffer) };
+    if len <= 0 {
+        return false;
+    }
+    let class_name = String::from_utf16_lossy(&buffer[..len as usize]).to_ascii_lowercase();
+    class_name.contains("edit") || class_name.contains("search") || class_name.contains("richedit")
 }
 
 fn key_sample(vkey: i32) -> (bool, bool) {

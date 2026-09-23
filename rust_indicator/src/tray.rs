@@ -3,8 +3,8 @@ use windows::Win32::Foundation::{
     CloseHandle, BOOL, COLORREF, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, DeleteObject, DrawFocusRect, DrawTextW, FillRect, GetSysColor, GetSysColorBrush,
-    SelectObject, SetBkMode, SetTextColor, BACKGROUND_MODE, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+    CreateFontW, DeleteObject, DrawTextW, FillRect, GetSysColor, GetSysColorBrush, SelectObject,
+    SetBkMode, SetTextColor, BACKGROUND_MODE, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
     COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, DEFAULT_CHARSET,
     DEFAULT_PITCH, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_NORMAL,
     FW_SEMIBOLD, HBRUSH, HDC, HFONT, OUT_DEFAULT_PRECIS, TRANSPARENT,
@@ -28,7 +28,7 @@ use windows::Win32::UI::Controls::{
     LVITEMW, LVM_DELETEALLITEMS, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
     LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST, LVNI_SELECTED, LVSIL_SMALL,
     LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOCOLUMNHEADER, LVS_OWNERDRAWFIXED, LVS_REPORT,
-    LVS_SHOWSELALWAYS, LVS_SINGLESEL, ODS_FOCUS, ODS_SELECTED,
+    LVS_SHOWSELALWAYS, LVS_SINGLESEL, ODS_SELECTED,
 };
 use windows::Win32::UI::Shell::{
     SHGetFileInfoW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
@@ -1104,9 +1104,6 @@ unsafe fn draw_app_rule_item(draw: &DRAWITEMSTRUCT) -> bool {
     let _ = SetTextColor(draw.hDC, old_color);
     let _ = SelectObject(draw.hDC, old_font);
 
-    if draw.itemState.0 & ODS_FOCUS.0 != 0 {
-        let _ = DrawFocusRect(draw.hDC, &draw.rcItem);
-    }
     true
 }
 
