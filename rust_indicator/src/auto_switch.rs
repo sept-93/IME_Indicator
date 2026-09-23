@@ -27,6 +27,7 @@ const ADOBE_ENGLISH_RETRY_MS: u64 = 120;
 const EDITABLE_ENTRY_RETRY_WINDOW_MS: u64 = 260;
 const EDITABLE_ENTRY_RETRY_INTERVAL_MS: u64 = 70;
 const DOUBLE_CLICK_HOLD_MS: u64 = 1500;
+const CHAT_CHINESE_RETRY_MS: u64 = 120;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LanguageTarget {
@@ -78,6 +79,8 @@ pub struct AutoSwitcher {
     editable_entry: Option<(SwitchContextKey, Instant)>,
     editable_entry_last_attempt: Option<Instant>,
     manual_double_click_hold: Option<(u32, HWND, Instant)>,
+    manual_language_override: Option<(u32, HWND, LanguageTarget)>,
+    chat_chinese_attempts: HashMap<u32, Instant>,
 }
 
 impl AutoSwitcher {
@@ -92,6 +95,8 @@ impl AutoSwitcher {
             editable_entry: None,
             editable_entry_last_attempt: None,
             manual_double_click_hold: None,
+            manual_language_override: None,
+            chat_chinese_attempts: HashMap::new(),
         }
     }
 
@@ -102,6 +107,8 @@ impl AutoSwitcher {
             self.editable_entry = None;
             self.editable_entry_last_attempt = None;
             self.manual_double_click_hold = None;
+            self.manual_language_override = None;
+            self.chat_chinese_attempts.clear();
             return;
         }
         if !self.enabled_last {
@@ -110,11 +117,21 @@ impl AutoSwitcher {
             self.editable_entry = None;
             self.editable_entry_last_attempt = None;
             self.manual_double_click_hold = None;
+            self.manual_language_override = None;
+            self.chat_chinese_attempts.clear();
             self.enabled_last = true;
         }
 
         if !context.editable {
             self.manual_double_click_hold = None;
+            self.manual_language_override = None;
+        } else if self
+            .manual_language_override
+            .is_some_and(|(process_id, focused_hwnd, _)| {
+                process_id != context.process_id || focused_hwnd != context.focused_hwnd
+            })
+        {
+            self.manual_language_override = None;
         }
 
         // 即使仍在同一个输入框，也要保存本轮的瞬时双击事件。防抖计时和
@@ -183,16 +200,15 @@ impl AutoSwitcher {
 
         if should_toggle_double_click(rule, context, &process_name) {
             // 双击是独立的手动覆盖：严格按本轮真实输入法状态反转。
+            let manual_target = double_click_target(chinese_mode);
             self.applied_context = Some(context_key);
             self.editable_entry = None;
             self.editable_entry_last_attempt = None;
             self.manual_double_click_hold =
                 Some((context.process_id, context.focused_hwnd, Instant::now()));
-            let _ = switch_language(
-                context.focused_hwnd,
-                context.foreground_hwnd,
-                double_click_target(chinese_mode),
-            );
+            self.manual_language_override =
+                Some((context.process_id, context.focused_hwnd, manual_target));
+            let _ = switch_language(context.focused_hwnd, context.foreground_hwnd, manual_target);
             return;
         }
 
@@ -242,9 +258,26 @@ impl AutoSwitcher {
                 }),
             self.editable_entry_last_attempt.map(|last| last.elapsed()),
         );
+        let manual_english_override =
+            self.manual_language_override
+                .is_some_and(|(process_id, focused_hwnd, target)| {
+                    process_id == context.process_id
+                        && focused_hwnd == context.focused_hwnd
+                        && target == LanguageTarget::English
+                });
+        let enforce_chat_chinese = should_enforce_chat_chinese(
+            rule == "auto" && is_chat_input_process(&process_name),
+            context.editable,
+            chinese_mode,
+            manual_english_override,
+            self.chat_chinese_attempts
+                .get(&context.process_id)
+                .map(Instant::elapsed),
+        );
         if self.applied_context.as_ref() == Some(&context_key)
             && !enforce_adobe_english
             && !retry_editable_chinese
+            && !enforce_chat_chinese
         {
             return;
         }
@@ -256,6 +289,10 @@ impl AutoSwitcher {
 
         if adobe_auto && !context.editable {
             self.adobe_english_attempts
+                .insert(context.process_id, Instant::now());
+        }
+        if enforce_chat_chinese {
+            self.chat_chinese_attempts
                 .insert(context.process_id, Instant::now());
         }
         if target == LanguageTarget::Chinese && context.editable {
@@ -276,6 +313,18 @@ fn is_adobe_design_process(process_name: &str) -> bool {
     ["Photoshop.exe", "Illustrator.exe"]
         .iter()
         .any(|candidate| process_name.eq_ignore_ascii_case(candidate))
+}
+
+fn is_chat_input_process(process_name: &str) -> bool {
+    [
+        "Weixin.exe",
+        "WXWork.exe",
+        "WeCom.exe",
+        "Feishu.exe",
+        "Lark.exe",
+    ]
+    .iter()
+    .any(|candidate| process_name.eq_ignore_ascii_case(candidate))
 }
 
 fn is_office_edit_process(process_name: &str) -> bool {
@@ -324,6 +373,22 @@ fn should_enforce_adobe_english(
         && chinese_mode
         && since_last_attempt.map_or(true, |elapsed| {
             elapsed >= Duration::from_millis(ADOBE_ENGLISH_RETRY_MS)
+        })
+}
+
+fn should_enforce_chat_chinese(
+    chat_auto: bool,
+    editable: bool,
+    chinese_mode: bool,
+    manual_english_override: bool,
+    since_last_attempt: Option<Duration>,
+) -> bool {
+    chat_auto
+        && editable
+        && !chinese_mode
+        && !manual_english_override
+        && since_last_attempt.map_or(true, |elapsed| {
+            elapsed >= Duration::from_millis(CHAT_CHINESE_RETRY_MS)
         })
 }
 
@@ -477,8 +542,8 @@ mod tests {
     use super::{
         default_rule_for_process, double_click_target, ime_open_status_for_target,
         is_indicator_only_process, refresh_candidate, should_enforce_adobe_english,
-        should_retry_editable_chinese, should_toggle_double_click, supports_double_click_toggle,
-        target_for, LanguageTarget, SwitchContextKey,
+        should_enforce_chat_chinese, should_retry_editable_chinese, should_toggle_double_click,
+        supports_double_click_toggle, target_for, LanguageTarget, SwitchContextKey,
     };
     use crate::caret_detector::FocusContext;
 
@@ -544,6 +609,27 @@ mod tests {
         ));
         assert!(!should_enforce_adobe_english(true, true, true, None));
         assert!(!should_enforce_adobe_english(true, false, false, None));
+    }
+
+    #[test]
+    fn chat_inputs_recover_chinese_but_respect_double_click_english() {
+        assert!(should_enforce_chat_chinese(true, true, false, false, None));
+        assert!(!should_enforce_chat_chinese(true, true, false, true, None));
+        assert!(!should_enforce_chat_chinese(true, true, true, false, None));
+        assert!(!should_enforce_chat_chinese(
+            true,
+            true,
+            false,
+            false,
+            Some(Duration::from_millis(80))
+        ));
+        assert!(should_enforce_chat_chinese(
+            true,
+            true,
+            false,
+            false,
+            Some(Duration::from_millis(120))
+        ));
     }
 
     #[test]

@@ -109,8 +109,8 @@ const TRANSIENT_CARET_APPS: &[&str] = &[
     "Feishu.exe",
     "Lark.exe",
 ];
-const CARET_DROPOUT_GRACE_MS: u64 = 350;
-const PASTE_CARET_GRACE_MS: u64 = 1500;
+const CARET_DROPOUT_GRACE_MS: u64 = 500;
+const PASTE_CARET_GRACE_MS: u64 = 3000;
 
 // UIA/IME 查询偶尔会让主检测循环停顿几十到数百毫秒。单独锁存 Esc 的
 // 按下沿，避免 Photoshop/Illustrator 已经退出文字编辑，但主循环漏掉按键。
@@ -273,6 +273,7 @@ pub struct CaretDetector {
     office_caret_suppressed: HashSet<u32>,
     design_text_cursor_handles: HashMap<u32, isize>,
     pending_design_native: Option<(u32, Instant)>,
+    pending_design_canvas: Option<(u32, Instant)>,
     pending_design_tool_check: Option<(u32, Instant)>,
     pending_office_edit: Option<(u32, Instant)>,
     transient_editable_seen: HashMap<u32, (usize, usize, Instant)>,
@@ -311,6 +312,7 @@ impl CaretDetector {
             office_caret_suppressed: HashSet::new(),
             design_text_cursor_handles: HashMap::new(),
             pending_design_native: None,
+            pending_design_canvas: None,
             pending_design_tool_check: None,
             pending_office_edit: None,
             transient_editable_seen: HashMap::new(),
@@ -573,7 +575,7 @@ impl CaretDetector {
         let (enter_now, enter_since_last) = key_sample(VK_RETURN.0 as i32);
         let (left_now, left_since_last) = key_sample(VK_LBUTTON.0 as i32);
         let (v_now, v_since_last) = key_sample(0x56); // V
-        let (ctrl_now, _) = key_sample(VK_CONTROL.0 as i32);
+        let (ctrl_now, ctrl_since_last) = key_sample(VK_CONTROL.0 as i32);
 
         // 同时使用高位按键状态和低位“自上次查询后按过”标志，避免短按 T/Esc
         // 刚好落在两次 30ms 轮询之间，造成 Illustrator 偶发无法进入或退出。
@@ -585,6 +587,8 @@ impl CaretDetector {
         let enter_pressed = enter_since_last || (enter_now && !self.enter_down);
         let direct_left_pressed = left_since_last || (left_now && !self.left_down);
         let v_pressed = v_since_last || (v_now && !self.v_down);
+        let ctrl_active = ctrl_now || ctrl_since_last;
+        let v_tool_pressed = v_pressed && !ctrl_active;
         self.t_down = t_now;
         self.b_down = b_now;
         self.escape_down = escape_now;
@@ -596,7 +600,7 @@ impl CaretDetector {
             return false;
         }
 
-        if ctrl_now && v_pressed && process_matches(process_name, TRANSIENT_CARET_APPS) {
+        if ctrl_active && v_pressed && process_matches(process_name, TRANSIENT_CARET_APPS) {
             self.paste_started.insert(process_id, Instant::now());
         }
         self.paste_started
@@ -637,6 +641,27 @@ impl CaretDetector {
             self.design_text_cursor_handles
                 .retain(|pid, _| *pid == process_id);
 
+            if let Some((pid, started)) = self.pending_design_canvas {
+                if pid != process_id || started.elapsed() > Duration::from_millis(500) {
+                    self.pending_design_canvas = None;
+                } else if should_confirm_pending_design_text(
+                    started.elapsed(),
+                    crate::cursor_detector::is_text_cursor(),
+                ) {
+                    // Adobe 在处理完双击后才把画布光标切成文字光标。延迟确认
+                    // 可以识别已有文字，同时不会把移动/抓手/笔刷光标当成文字。
+                    self.design_text_tools.insert(process_id);
+                    self.design_text_processes.insert(process_id);
+                    self.design_native_processes.remove(&process_id);
+                    self.design_caret_suppressed.remove(&process_id);
+                    if let Some(cursor) = crate::cursor_detector::current_cursor_handle() {
+                        self.design_text_cursor_handles.insert(process_id, cursor);
+                    }
+                    self.pending_design_canvas = None;
+                    self.pending_design_native = None;
+                }
+            }
+
             let native_was_tracked = self.design_native_processes.contains(&process_id);
             if !has_caret && native_was_tracked {
                 // Photoshop 的图层重命名框失焦后偶尔还会短暂重新暴露 Caret。
@@ -647,11 +672,12 @@ impl CaretDetector {
                 self.design_text_cursor_handles.remove(&process_id);
                 self.design_caret_suppressed.insert(process_id);
                 self.pending_design_native = None;
+                self.pending_design_canvas = None;
             }
             if let Some((pid, started)) = self.pending_design_native {
                 if pid != process_id || started.elapsed() > Duration::from_millis(450) {
                     self.pending_design_native = None;
-                } else if has_caret {
+                } else if native_edit_focus {
                     self.design_caret_suppressed.remove(&process_id);
                     self.design_native_processes.insert(process_id);
                     self.pending_design_native = None;
@@ -675,12 +701,13 @@ impl CaretDetector {
             let was_canvas_active = self.design_text_processes.contains(&process_id);
             let was_native_active = self.design_native_processes.contains(&process_id);
             let was_active = was_canvas_active || was_native_active;
-            if escape_pressed || (ctrl_now && enter_pressed) {
+            if escape_pressed || (ctrl_active && enter_pressed) {
                 self.design_text_processes.remove(&process_id);
                 self.design_text_tools.remove(&process_id);
                 self.design_native_processes.remove(&process_id);
                 self.design_text_cursor_handles.remove(&process_id);
                 self.design_caret_suppressed.insert(process_id);
+                self.pending_design_canvas = None;
                 // Esc/Ctrl+Enter 一次就结束输入态，下一轮上下文立即回到英文。
                 self.last_left_click = None;
                 return false;
@@ -701,6 +728,7 @@ impl CaretDetector {
                 self.design_text_cursor_handles.remove(&process_id);
                 self.design_caret_suppressed.insert(process_id);
                 self.pending_design_native = None;
+                self.pending_design_canvas = None;
                 self.last_left_click = None;
                 return false;
             } else if left_pressed && !double_click && was_canvas_active {
@@ -721,11 +749,11 @@ impl CaretDetector {
                 self.design_text_tools.insert(process_id);
                 self.design_native_processes.remove(&process_id);
                 self.design_caret_suppressed.insert(process_id);
-            } else if !was_active && (b_pressed || v_pressed) {
+            } else if !was_active && (b_pressed || v_tool_pressed) {
                 self.design_text_tools.remove(&process_id);
                 self.design_native_processes.remove(&process_id);
                 self.design_caret_suppressed.insert(process_id);
-            } else if was_canvas_active && (b_pressed || v_pressed) {
+            } else if was_canvas_active && (b_pressed || v_tool_pressed) {
                 self.pending_design_tool_check = Some((process_id, Instant::now()));
             }
 
@@ -738,6 +766,7 @@ impl CaretDetector {
                 self.design_caret_suppressed.remove(&process_id);
                 self.design_native_processes.insert(process_id);
                 self.pending_design_native = None;
+                self.pending_design_canvas = None;
                 return true;
             }
 
@@ -755,13 +784,14 @@ impl CaretDetector {
                         self.design_text_cursor_handles.insert(process_id, cursor);
                     }
                     self.last_left_click = None;
-                } else if double_click && standard_arrow {
+                } else if double_click {
+                    // 点击瞬间仍可能是移动/选择光标，等待 Adobe 完成事件处理后
+                    // 再以文字光标或真实 Caret 确认，期间不提前切换中文。
+                    self.pending_design_canvas = Some((process_id, Instant::now()));
                     self.pending_design_native = Some((process_id, Instant::now()));
-                    self.design_caret_suppressed.remove(&process_id);
-                    if has_caret {
-                        self.design_native_processes.insert(process_id);
-                        self.pending_design_native = None;
-                    }
+                    self.design_text_processes.remove(&process_id);
+                    self.design_native_processes.remove(&process_id);
+                    self.design_caret_suppressed.insert(process_id);
                 } else if self.design_text_tools.contains(&process_id) && text_cursor {
                     self.design_text_processes.insert(process_id);
                     self.design_native_processes.remove(&process_id);
@@ -797,6 +827,7 @@ impl CaretDetector {
         self.design_caret_suppressed.clear();
         self.design_text_cursor_handles.clear();
         self.pending_design_native = None;
+        self.pending_design_canvas = None;
         self.pending_design_tool_check = None;
 
         if process_matches(process_name, OFFICE_EDIT_APPS) {
@@ -1032,6 +1063,10 @@ fn should_enter_design_canvas_text(
     text_cursor && (double_click || text_tool_armed)
 }
 
+fn should_confirm_pending_design_text(elapsed: Duration, text_cursor: bool) -> bool {
+    text_cursor && elapsed >= Duration::from_millis(40) && elapsed <= Duration::from_millis(500)
+}
+
 fn should_preserve_transient_editable(
     same_foreground: bool,
     same_focus: bool,
@@ -1104,10 +1139,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        consume_click_samples, process_matches, should_enter_design_canvas_text,
-        should_preserve_transient_editable, ClickSample, CARET_COMPAT_APPS, CARET_FAST_PATH_APPS,
-        DESIGN_TEXT_SHORTCUT_APPS, GUI_ONLY_CARET_APPS, INDICATOR_ONLY_APPS, OFFICE_EDIT_APPS,
-        OFFICE_SPREADSHEET_APPS,
+        consume_click_samples, process_matches, should_confirm_pending_design_text,
+        should_enter_design_canvas_text, should_preserve_transient_editable, ClickSample,
+        CARET_COMPAT_APPS, CARET_FAST_PATH_APPS, DESIGN_TEXT_SHORTCUT_APPS, GUI_ONLY_CARET_APPS,
+        INDICATOR_ONLY_APPS, OFFICE_EDIT_APPS, OFFICE_SPREADSHEET_APPS,
     };
 
     #[test]
@@ -1143,6 +1178,18 @@ mod tests {
         assert!(!should_enter_design_canvas_text(false, true, false));
         assert!(should_enter_design_canvas_text(true, false, true));
         assert!(should_enter_design_canvas_text(false, true, true));
+        assert!(!should_confirm_pending_design_text(
+            Duration::from_millis(20),
+            true
+        ));
+        assert!(should_confirm_pending_design_text(
+            Duration::from_millis(80),
+            true
+        ));
+        assert!(!should_confirm_pending_design_text(
+            Duration::from_millis(80),
+            false
+        ));
     }
 
     #[test]
