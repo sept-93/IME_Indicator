@@ -3,4 +3,4 @@
 轻量级中英输入法状态实时提示工具。
 GitHub: https://github.com/sept-93/IME_Indicator
 作者：Antigravity & Haujet
-版本：v0.6.18
+版本：v0.6.19

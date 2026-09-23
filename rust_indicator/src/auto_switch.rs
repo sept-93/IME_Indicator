@@ -28,6 +28,7 @@ const EDITABLE_ENTRY_RETRY_WINDOW_MS: u64 = 260;
 const EDITABLE_ENTRY_RETRY_INTERVAL_MS: u64 = 70;
 const DOUBLE_CLICK_HOLD_MS: u64 = 1500;
 const CHAT_CHINESE_RETRY_MS: u64 = 120;
+const CHAT_NON_INPUT_SETTLE_MS: u64 = 450;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LanguageTarget {
@@ -158,7 +159,13 @@ impl AutoSwitcher {
             }
         }
 
-        let settle = Duration::from_millis(crate::config::auto_switch_settle_ms());
+        let candidate_is_chat = self.candidate.as_ref().is_some_and(|candidate| {
+            process_name(candidate.process_id).is_some_and(|name| is_chat_input_process(&name))
+        });
+        let settle = Duration::from_millis(non_input_settle_ms(
+            candidate_is_chat,
+            crate::config::auto_switch_settle_ms(),
+        ));
         if self
             .candidate
             .as_ref()
@@ -325,6 +332,14 @@ fn is_chat_input_process(process_name: &str) -> bool {
     ]
     .iter()
     .any(|candidate| process_name.eq_ignore_ascii_case(candidate))
+}
+
+fn non_input_settle_ms(chat_process: bool, configured_ms: u64) -> u64 {
+    if chat_process {
+        configured_ms.max(CHAT_NON_INPUT_SETTLE_MS)
+    } else {
+        configured_ms
+    }
 }
 
 fn is_office_edit_process(process_name: &str) -> bool {
@@ -541,9 +556,10 @@ mod tests {
 
     use super::{
         default_rule_for_process, double_click_target, ime_open_status_for_target,
-        is_indicator_only_process, refresh_candidate, should_enforce_adobe_english,
-        should_enforce_chat_chinese, should_retry_editable_chinese, should_toggle_double_click,
-        supports_double_click_toggle, target_for, LanguageTarget, SwitchContextKey,
+        is_indicator_only_process, non_input_settle_ms, refresh_candidate,
+        should_enforce_adobe_english, should_enforce_chat_chinese, should_retry_editable_chinese,
+        should_toggle_double_click, supports_double_click_toggle, target_for, LanguageTarget,
+        SwitchContextKey,
     };
     use crate::caret_detector::FocusContext;
 
@@ -630,6 +646,8 @@ mod tests {
             false,
             Some(Duration::from_millis(120))
         ));
+        assert_eq!(non_input_settle_ms(true, 80), 450);
+        assert_eq!(non_input_settle_ms(false, 80), 80);
     }
 
     #[test]
