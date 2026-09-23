@@ -53,6 +53,21 @@ impl From<&FocusContext> for SwitchContextKey {
     }
 }
 
+/// 刷新当前采样，但只用稳定的输入语义判断是否进入了新上下文。
+/// `input_double_click` 是单轮事件，不能参与上下文身份比较，却必须随每次
+/// 采样更新；否则同一输入框内的双击会被旧候选状态吞掉。
+fn refresh_candidate(
+    candidate: &mut Option<FocusContext>,
+    context: FocusContext,
+) -> (bool, SwitchContextKey) {
+    let next_key = SwitchContextKey::from(&context);
+    let changed = candidate
+        .as_ref()
+        .map_or(true, |current| SwitchContextKey::from(current) != next_key);
+    *candidate = Some(context);
+    (changed, next_key)
+}
+
 pub struct AutoSwitcher {
     candidate: Option<FocusContext>,
     candidate_since: Instant,
@@ -102,11 +117,9 @@ impl AutoSwitcher {
             self.manual_double_click_hold = None;
         }
 
-        let next_key = SwitchContextKey::from(&context);
-        let changed = self
-            .candidate
-            .as_ref()
-            .map_or(true, |current| SwitchContextKey::from(current) != next_key);
+        // 即使仍在同一个输入框，也要保存本轮的瞬时双击事件。防抖计时和
+        // 自动切换状态仅在稳定上下文变化时重置。
+        let (changed, next_key) = refresh_candidate(&mut self.candidate, context);
         if changed {
             let now = Instant::now();
             if next_key.editable && !next_key.password {
@@ -116,7 +129,6 @@ impl AutoSwitcher {
                 self.editable_entry = None;
                 self.editable_entry_last_attempt = None;
             }
-            self.candidate = Some(context);
             self.candidate_since = now;
             // 输入框和搜索框优先响应：一旦检测到 Caret/Edit/Document 焦点，
             // 本轮立即切换。非输入区仍保留短暂防抖，避免切窗口时闪动。
@@ -460,8 +472,9 @@ mod tests {
 
     use super::{
         default_rule_for_process, double_click_target, ime_open_status_for_target,
-        is_indicator_only_process, should_enforce_adobe_english, should_retry_editable_chinese,
-        supports_double_click_toggle, target_for, LanguageTarget, SwitchContextKey,
+        is_indicator_only_process, refresh_candidate, should_enforce_adobe_english,
+        should_retry_editable_chinese, supports_double_click_toggle, target_for, LanguageTarget,
+        SwitchContextKey,
     };
     use crate::caret_detector::FocusContext;
 
@@ -601,5 +614,20 @@ mod tests {
             SwitchContextKey::from(&input),
             SwitchContextKey::from(&double_clicked_input)
         );
+    }
+
+    #[test]
+    fn same_input_refreshes_transient_double_click_event() {
+        let mut candidate = Some(context(true, false));
+        let mut double_clicked_input = context(true, false);
+        double_clicked_input.input_double_click = true;
+
+        let (changed, key) = refresh_candidate(&mut candidate, double_clicked_input);
+
+        assert!(!changed);
+        assert!(key.editable);
+        assert!(candidate
+            .as_ref()
+            .is_some_and(|current| current.input_double_click));
     }
 }
