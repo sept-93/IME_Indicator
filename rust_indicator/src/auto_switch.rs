@@ -26,6 +26,7 @@ const INPUTLANGCHANGE_SYSCHARSET: usize = 0x0001;
 const ADOBE_ENGLISH_RETRY_MS: u64 = 120;
 const EDITABLE_ENTRY_RETRY_WINDOW_MS: u64 = 260;
 const EDITABLE_ENTRY_RETRY_INTERVAL_MS: u64 = 70;
+const DOUBLE_CLICK_HOLD_MS: u64 = 1500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LanguageTarget {
@@ -76,6 +77,7 @@ pub struct AutoSwitcher {
     adobe_english_attempts: HashMap<u32, Instant>,
     editable_entry: Option<(SwitchContextKey, Instant)>,
     editable_entry_last_attempt: Option<Instant>,
+    manual_double_click_hold: Option<(u32, HWND, Instant)>,
 }
 
 impl AutoSwitcher {
@@ -89,6 +91,7 @@ impl AutoSwitcher {
             adobe_english_attempts: HashMap::new(),
             editable_entry: None,
             editable_entry_last_attempt: None,
+            manual_double_click_hold: None,
         }
     }
 
@@ -98,6 +101,7 @@ impl AutoSwitcher {
             self.enabled_last = false;
             self.editable_entry = None;
             self.editable_entry_last_attempt = None;
+            self.manual_double_click_hold = None;
             return;
         }
         if !self.enabled_last {
@@ -105,7 +109,12 @@ impl AutoSwitcher {
             self.applied_context = None;
             self.editable_entry = None;
             self.editable_entry_last_attempt = None;
+            self.manual_double_click_hold = None;
             self.enabled_last = true;
+        }
+
+        if !context.editable {
+            self.manual_double_click_hold = None;
         }
 
         // 即使仍在同一个输入框，也要保存本轮的瞬时双击事件。防抖计时和
@@ -172,18 +181,37 @@ impl AutoSwitcher {
             return;
         };
 
-        if should_force_double_click_chinese(rule, context, chinese_mode, &process_name) {
-            // 双击只提供“英文 -> 中文”的单向快捷操作。当前已经是中文时
-            // 不做反向切换，继续遵守输入框默认中文的原有规则。
+        if should_toggle_double_click(rule, context, &process_name) {
+            // 双击是独立的手动覆盖：严格按本轮真实输入法状态反转。
             self.applied_context = Some(context_key);
             self.editable_entry = None;
             self.editable_entry_last_attempt = None;
+            self.manual_double_click_hold =
+                Some((context.process_id, context.focused_hwnd, Instant::now()));
             let _ = switch_language(
                 context.focused_hwnd,
                 context.foreground_hwnd,
-                LanguageTarget::Chinese,
+                double_click_target(chinese_mode),
             );
             return;
+        }
+
+        let hold_manual_mode =
+            self.manual_double_click_hold
+                .is_some_and(|(process_id, focused_hwnd, started)| {
+                    process_id == context.process_id
+                        && focused_hwnd == context.focused_hwnd
+                        && started.elapsed() <= Duration::from_millis(DOUBLE_CLICK_HOLD_MS)
+                });
+        if hold_manual_mode && rule == "auto" && context.editable {
+            // 双击选中文字后，短时间内的单击定位不重新套用默认中文。
+            self.applied_context = Some(context_key);
+            self.editable_entry = None;
+            self.editable_entry_last_attempt = None;
+            return;
+        }
+        if self.manual_double_click_hold.is_some() && !hold_manual_mode {
+            self.manual_double_click_hold = None;
         }
 
         if chinese_mode
@@ -263,24 +291,26 @@ fn is_office_edit_process(process_name: &str) -> bool {
     .any(|candidate| process_name.eq_ignore_ascii_case(candidate))
 }
 
-fn supports_double_click_chinese(process_name: &str) -> bool {
+fn supports_double_click_toggle(process_name: &str) -> bool {
     !is_indicator_only_process(process_name)
         && !is_adobe_design_process(process_name)
         && !is_office_edit_process(process_name)
 }
 
-fn should_force_double_click_chinese(
-    rule: &str,
-    context: &FocusContext,
-    chinese_mode: bool,
-    process_name: &str,
-) -> bool {
+fn should_toggle_double_click(rule: &str, context: &FocusContext, process_name: &str) -> bool {
     rule == "auto"
         && context.input_double_click
         && context.editable
         && !context.password
-        && !chinese_mode
-        && supports_double_click_chinese(process_name)
+        && supports_double_click_toggle(process_name)
+}
+
+fn double_click_target(chinese_mode: bool) -> LanguageTarget {
+    if chinese_mode {
+        LanguageTarget::English
+    } else {
+        LanguageTarget::Chinese
+    }
 }
 
 fn should_enforce_adobe_english(
@@ -445,10 +475,10 @@ mod tests {
     use windows::Win32::Foundation::HWND;
 
     use super::{
-        default_rule_for_process, ime_open_status_for_target, is_indicator_only_process,
-        refresh_candidate, should_enforce_adobe_english, should_force_double_click_chinese,
-        should_retry_editable_chinese, supports_double_click_chinese, target_for, LanguageTarget,
-        SwitchContextKey,
+        default_rule_for_process, double_click_target, ime_open_status_for_target,
+        is_indicator_only_process, refresh_candidate, should_enforce_adobe_english,
+        should_retry_editable_chinese, should_toggle_double_click, supports_double_click_toggle,
+        target_for, LanguageTarget, SwitchContextKey,
     };
     use crate::caret_detector::FocusContext;
 
@@ -545,34 +575,29 @@ mod tests {
     }
 
     #[test]
-    fn double_click_chinese_skips_conflicting_apps() {
-        assert!(supports_double_click_chinese("Weixin.exe"));
-        assert!(supports_double_click_chinese("WXWork.exe"));
-        assert!(supports_double_click_chinese("chrome.exe"));
-        assert!(!supports_double_click_chinese("Photoshop.exe"));
-        assert!(!supports_double_click_chinese("Illustrator.exe"));
-        assert!(!supports_double_click_chinese("et.exe"));
-        assert!(!supports_double_click_chinese("WINWORD.EXE"));
-        assert!(!supports_double_click_chinese("JianyingPro.exe"));
+    fn double_click_toggle_skips_conflicting_apps() {
+        assert!(supports_double_click_toggle("Weixin.exe"));
+        assert!(supports_double_click_toggle("WXWork.exe"));
+        assert!(supports_double_click_toggle("chrome.exe"));
+        assert!(!supports_double_click_toggle("Photoshop.exe"));
+        assert!(!supports_double_click_toggle("Illustrator.exe"));
+        assert!(!supports_double_click_toggle("et.exe"));
+        assert!(!supports_double_click_toggle("WINWORD.EXE"));
+        assert!(!supports_double_click_toggle("JianyingPro.exe"));
     }
 
     #[test]
-    fn double_click_is_one_way_from_english_to_chinese() {
+    fn double_click_reverses_the_current_language() {
         let mut double_clicked_input = context(true, false);
         double_clicked_input.input_double_click = true;
 
-        assert!(should_force_double_click_chinese(
+        assert!(should_toggle_double_click(
             "auto",
             &double_clicked_input,
-            false,
             "Weixin.exe"
         ));
-        assert!(!should_force_double_click_chinese(
-            "auto",
-            &double_clicked_input,
-            true,
-            "Weixin.exe"
-        ));
+        assert_eq!(double_click_target(false), LanguageTarget::Chinese);
+        assert_eq!(double_click_target(true), LanguageTarget::English);
     }
 
     #[test]

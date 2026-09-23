@@ -177,6 +177,32 @@ fn take_click_samples(process_id: u32) -> Vec<ClickSample> {
     matching
 }
 
+fn consume_click_samples(
+    last_left_click: &mut Option<(Instant, u32, i32, i32)>,
+    click_samples: impl IntoIterator<Item = ClickSample>,
+) -> bool {
+    let mut double_click = false;
+    for sample in click_samples {
+        if last_left_click.as_ref().is_some_and(|(at, pid, x, y)| {
+            *pid == sample.process_id
+                && sample
+                    .at
+                    .checked_duration_since(*at)
+                    .is_some_and(|elapsed| elapsed <= Duration::from_millis(500))
+                && (sample.x - *x).abs() <= 8
+                && (sample.y - *y).abs() <= 8
+        }) {
+            double_click = true;
+        }
+        *last_left_click = Some((sample.at, sample.process_id, sample.x, sample.y));
+    }
+    if double_click {
+        // 一次双击只消费成一个切换事件。第二击不再作为下一次双击的首击。
+        *last_left_click = None;
+    }
+    double_click
+}
+
 // ============================================================================
 // 类型定义
 // ============================================================================
@@ -506,30 +532,7 @@ impl CaretDetector {
             }
         }
         let left_pressed = !click_samples.is_empty();
-        let mut double_click = false;
-        for sample in click_samples {
-            if self
-                .last_left_click
-                .as_ref()
-                .is_some_and(|(at, pid, x, y)| {
-                    *pid == sample.process_id
-                        && sample
-                            .at
-                            .checked_duration_since(*at)
-                            .is_some_and(|elapsed| elapsed <= Duration::from_millis(500))
-                        && (sample.x - *x).abs() <= 8
-                        && (sample.y - *y).abs() <= 8
-                })
-            {
-                double_click = true;
-            }
-            self.last_left_click = Some((sample.at, sample.process_id, sample.x, sample.y));
-        }
-        if double_click {
-            // 一次双击只消费成一个切换事件。第二击不再作为下一次双击的首击，
-            // 避免选中文字后紧接着单击定位时又反向切换。
-            self.last_left_click = None;
-        }
+        let double_click = consume_click_samples(&mut self.last_left_click, click_samples);
         self.input_double_click = double_click;
         let standard_arrow = left_pressed && crate::cursor_detector::is_standard_arrow_cursor();
         let native_edit_focus = has_caret
@@ -761,7 +764,8 @@ impl CaretDetector {
         self.office_edit_processes.clear();
         self.office_caret_suppressed.clear();
         self.pending_office_edit = None;
-        self.last_left_click = None;
+        // 普通输入框也必须跨检测轮次保留第一击；否则两次点击分别落在
+        // 相邻轮询中时，第一击会在这里被清空，永远无法形成双击。
         false
     }
 
@@ -974,10 +978,40 @@ fn process_name(process_id: u32) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::{
-        process_matches, CARET_COMPAT_APPS, CARET_FAST_PATH_APPS, DESIGN_TEXT_SHORTCUT_APPS,
-        GUI_ONLY_CARET_APPS, INDICATOR_ONLY_APPS, OFFICE_EDIT_APPS, OFFICE_SPREADSHEET_APPS,
+        consume_click_samples, process_matches, ClickSample, CARET_COMPAT_APPS,
+        CARET_FAST_PATH_APPS, DESIGN_TEXT_SHORTCUT_APPS, GUI_ONLY_CARET_APPS, INDICATOR_ONLY_APPS,
+        OFFICE_EDIT_APPS, OFFICE_SPREADSHEET_APPS,
     };
+
+    #[test]
+    fn ordinary_input_double_click_survives_separate_poll_cycles() {
+        let started = Instant::now();
+        let mut last_click = None;
+
+        assert!(!consume_click_samples(
+            &mut last_click,
+            [ClickSample {
+                at: started,
+                process_id: 42,
+                x: 100,
+                y: 80,
+            }]
+        ));
+        assert!(last_click.is_some());
+        assert!(consume_click_samples(
+            &mut last_click,
+            [ClickSample {
+                at: started + Duration::from_millis(180),
+                process_id: 42,
+                x: 103,
+                y: 82,
+            }]
+        ));
+        assert!(last_click.is_none());
+    }
 
     #[test]
     fn wechat_uses_caret_fast_path() {
