@@ -224,6 +224,9 @@ fn switch_language(
             if target_hwnd.0.is_null() || (index == 1 && target_hwnd == focused_hwnd) {
                 continue;
             }
+            // 英文布局请求可能让 ImmGetDefaultIMEWnd 随即变为空，因此先保存
+            // 当前中文 IME 窗口，确保 Adobe 等自绘应用退出编辑时能立即关闭。
+            let ime_before = ImmGetDefaultIMEWnd(target_hwnd);
             let mut result = 0usize;
             let sent = SendMessageTimeoutW(
                 target_hwnd,
@@ -239,11 +242,20 @@ fn switch_language(
             }
             any_sent = true;
 
-            if target == LanguageTarget::Chinese {
-                let ime_hwnd = ImmGetDefaultIMEWnd(target_hwnd);
+            let ime_after = ImmGetDefaultIMEWnd(target_hwnd);
+            for ime_hwnd in [ime_before, ime_after] {
                 if !ime_hwnd.0.is_null() {
-                    send_ime_control(ime_hwnd, IMC_SETOPENSTATUS, 1);
-                    send_ime_control(ime_hwnd, IMC_SETCONVERSIONMODE, IME_CMODE_NATIVE);
+                    send_ime_control(
+                        ime_hwnd,
+                        IMC_SETOPENSTATUS,
+                        ime_open_status_for_target(target),
+                    );
+                    if target == LanguageTarget::Chinese {
+                        send_ime_control(ime_hwnd, IMC_SETCONVERSIONMODE, IME_CMODE_NATIVE);
+                    }
+                }
+                if ime_after == ime_before {
+                    break;
                 }
             }
         }
@@ -252,6 +264,13 @@ fn switch_language(
         }
     }
     Ok(())
+}
+
+fn ime_open_status_for_target(target: LanguageTarget) -> isize {
+    match target {
+        LanguageTarget::Chinese => 1,
+        LanguageTarget::English => 0,
+    }
 }
 
 fn send_ime_control(hwnd: HWND, command: usize, value: isize) {
@@ -274,8 +293,8 @@ mod tests {
     use windows::Win32::Foundation::HWND;
 
     use super::{
-        default_rule_for_process, is_indicator_only_process, target_for, LanguageTarget,
-        SwitchContextKey,
+        default_rule_for_process, ime_open_status_for_target, is_indicator_only_process,
+        target_for, LanguageTarget, SwitchContextKey,
     };
     use crate::caret_detector::FocusContext;
 
@@ -319,6 +338,8 @@ mod tests {
             Some(LanguageTarget::English)
         );
         assert_eq!(target_for("ignore", false, true), None);
+        assert_eq!(ime_open_status_for_target(LanguageTarget::Chinese), 1);
+        assert_eq!(ime_open_status_for_target(LanguageTarget::English), 0);
     }
 
     #[test]
