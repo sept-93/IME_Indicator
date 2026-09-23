@@ -31,7 +31,7 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::Shell::{
     SHGetFileInfoW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NOTIFYICONDATAW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON,
+    NOTIFYICONDATAW, SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW,
@@ -971,9 +971,9 @@ fn process_info_from_id(process_id: u32) -> Option<(String, PathBuf)> {
 }
 
 unsafe fn create_app_image_list(apps: &[RunningApp]) -> (Option<HIMAGELIST>, Vec<i32>) {
-    // 使用 Shell 提供的原生 32px HICON，不再二次缩放/重采样；32px 高度同时
-    // 给列表行提供更舒适的上下间距。
-    let images = ImageList_Create(32, 32, ILC_COLOR32 | ILC_MASK, apps.len().max(1) as i32, 4);
+    // 28px 图像列表决定紧凑的列表行高；Shell 小图标保留系统原生清晰度，
+    // 同时让 16px 图标在选中底色内留出上下间距，不再铺满整行。
+    let images = ImageList_Create(28, 28, ILC_COLOR32 | ILC_MASK, apps.len().max(1) as i32, 4);
     if images.0 == 0 {
         return (None, vec![-1; apps.len()]);
     }
@@ -993,7 +993,7 @@ unsafe fn create_app_image_list(apps: &[RunningApp]) -> (Option<HIMAGELIST>, Vec
             Default::default(),
             Some(&mut file_info),
             std::mem::size_of::<SHFILEINFOW>() as u32,
-            SHGFI_ICON | SHGFI_LARGEICON,
+            SHGFI_ICON | SHGFI_SMALLICON,
         );
         if loaded != 0 && !file_info.hIcon.0.is_null() {
             image_indices.push(ImageList_ReplaceIcon(images, -1, file_info.hIcon));

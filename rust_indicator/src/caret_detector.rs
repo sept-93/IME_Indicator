@@ -462,8 +462,16 @@ impl CaretDetector {
             self.design_text_cursor_handles
                 .retain(|pid, _| *pid == process_id);
 
-            if !has_caret {
+            let native_was_tracked = self.design_native_processes.contains(&process_id);
+            if !has_caret && native_was_tracked {
+                // Photoshop 的图层重命名框失焦后偶尔还会短暂重新暴露 Caret。
+                // Caret 首次消失就视为编辑已经结束，并保持抑制状态，直到用户
+                // 再次明确双击或选择文字工具；否则下一次普通点击会回弹到中文。
                 self.design_native_processes.remove(&process_id);
+                self.design_text_tools.remove(&process_id);
+                self.design_text_cursor_handles.remove(&process_id);
+                self.design_caret_suppressed.insert(process_id);
+                self.pending_design_native = None;
             }
             if let Some((pid, started)) = self.pending_design_native {
                 if pid != process_id || started.elapsed() > Duration::from_millis(450) {
@@ -494,18 +502,18 @@ impl CaretDetector {
             let was_active = was_canvas_active || was_native_active;
             if escape_pressed || (ctrl_now && enter_pressed) {
                 self.design_text_processes.remove(&process_id);
+                self.design_text_tools.remove(&process_id);
                 self.design_native_processes.remove(&process_id);
                 self.design_text_cursor_handles.remove(&process_id);
                 self.design_caret_suppressed.insert(process_id);
                 // Esc/Ctrl+Enter 一次就结束输入态，下一轮上下文立即回到英文。
                 self.last_left_click = None;
-                if escape_pressed && !was_active {
-                    self.design_text_tools.remove(&process_id);
-                }
                 return false;
             } else if enter_pressed && was_native_active {
                 // 图层/对象重命名使用 Enter 提交；画布多行文字中的 Enter 不退出。
+                self.design_text_tools.remove(&process_id);
                 self.design_native_processes.remove(&process_id);
+                self.design_text_cursor_handles.remove(&process_id);
                 self.design_caret_suppressed.insert(process_id);
                 return false;
             } else if left_pressed && !double_click && was_native_active {
@@ -513,7 +521,9 @@ impl CaretDetector {
                 // 暂留一帧 Caret。任何下一次单击都已经提交重命名，必须先结束
                 // 中文输入态，不能再让下方的 has_caret 分支把它重新激活。
                 self.design_text_processes.remove(&process_id);
+                self.design_text_tools.remove(&process_id);
                 self.design_native_processes.remove(&process_id);
+                self.design_text_cursor_handles.remove(&process_id);
                 self.design_caret_suppressed.insert(process_id);
                 self.pending_design_native = None;
                 self.last_left_click = None;
@@ -526,7 +536,9 @@ impl CaretDetector {
                 {
                     // 双击已有文字进入编辑后，点击文字光标之外的区域立即退出。
                     self.design_text_processes.remove(&process_id);
+                    self.design_text_tools.remove(&process_id);
                     self.design_native_processes.remove(&process_id);
+                    self.design_text_cursor_handles.remove(&process_id);
                     self.design_caret_suppressed.insert(process_id);
                     self.pending_design_tool_check = None;
                     self.last_left_click = None;
@@ -573,18 +585,11 @@ impl CaretDetector {
                     // 普通区域点击必须优先于旧 Caret；否则图层重命名结束后
                     // Photoshop 残留的一帧 Caret 会把退出动作重新覆盖成中文。
                     self.design_text_processes.remove(&process_id);
+                    self.design_text_tools.remove(&process_id);
                     self.design_native_processes.remove(&process_id);
+                    self.design_text_cursor_handles.remove(&process_id);
                     self.design_caret_suppressed.insert(process_id);
-                } else if has_caret && !self.design_caret_suppressed.contains(&process_id) {
-                    self.design_native_processes.insert(process_id);
                 }
-            }
-
-            if has_caret
-                && !self.design_caret_suppressed.contains(&process_id)
-                && !self.design_text_processes.contains(&process_id)
-            {
-                self.design_native_processes.insert(process_id);
             }
             return self.design_text_processes.contains(&process_id)
                 || self.design_native_processes.contains(&process_id);
