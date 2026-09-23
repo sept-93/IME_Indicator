@@ -24,6 +24,8 @@ const IMC_SETOPENSTATUS: usize = 0x0006;
 const IME_CMODE_NATIVE: isize = 0x0001;
 const INPUTLANGCHANGE_SYSCHARSET: usize = 0x0001;
 const ADOBE_ENGLISH_RETRY_MS: u64 = 120;
+const EDITABLE_ENTRY_RETRY_WINDOW_MS: u64 = 260;
+const EDITABLE_ENTRY_RETRY_INTERVAL_MS: u64 = 70;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LanguageTarget {
@@ -57,6 +59,8 @@ pub struct AutoSwitcher {
     enabled_last: bool,
     adobe_editable_processes: HashSet<u32>,
     adobe_english_attempts: HashMap<u32, Instant>,
+    editable_entry: Option<(SwitchContextKey, Instant)>,
+    editable_entry_last_attempt: Option<Instant>,
 }
 
 impl AutoSwitcher {
@@ -68,6 +72,8 @@ impl AutoSwitcher {
             enabled_last: crate::tray::smart_switch_enabled(),
             adobe_editable_processes: HashSet::new(),
             adobe_english_attempts: HashMap::new(),
+            editable_entry: None,
+            editable_entry_last_attempt: None,
         }
     }
 
@@ -75,11 +81,15 @@ impl AutoSwitcher {
         let enabled = crate::tray::smart_switch_enabled();
         if !enabled {
             self.enabled_last = false;
+            self.editable_entry = None;
+            self.editable_entry_last_attempt = None;
             return;
         }
         if !self.enabled_last {
             self.candidate = None;
             self.applied_context = None;
+            self.editable_entry = None;
+            self.editable_entry_last_attempt = None;
             self.enabled_last = true;
         }
 
@@ -89,8 +99,16 @@ impl AutoSwitcher {
             .as_ref()
             .map_or(true, |current| SwitchContextKey::from(current) != next_key);
         if changed {
+            let now = Instant::now();
+            if next_key.editable && !next_key.password {
+                self.editable_entry = Some((next_key.clone(), now));
+                self.editable_entry_last_attempt = None;
+            } else {
+                self.editable_entry = None;
+                self.editable_entry_last_attempt = None;
+            }
             self.candidate = Some(context);
-            self.candidate_since = Instant::now();
+            self.candidate_since = now;
             // 输入框和搜索框优先响应：一旦检测到 Caret/Edit/Document 焦点，
             // 本轮立即切换。非输入区仍保留短暂防抖，避免切窗口时闪动。
             if !self
@@ -142,6 +160,16 @@ impl AutoSwitcher {
             return;
         };
 
+        if chinese_mode
+            && self
+                .editable_entry
+                .as_ref()
+                .is_some_and(|(entry_key, _)| entry_key == &context_key)
+        {
+            self.editable_entry = None;
+            self.editable_entry_last_attempt = None;
+        }
+
         let enforce_adobe_english = should_enforce_adobe_english(
             adobe_auto,
             context.editable,
@@ -150,17 +178,34 @@ impl AutoSwitcher {
                 .get(&context.process_id)
                 .map(Instant::elapsed),
         );
-        if self.applied_context.as_ref() == Some(&context_key) && !enforce_adobe_english {
+        let retry_editable_chinese = should_retry_editable_chinese(
+            target,
+            chinese_mode,
+            self.editable_entry
+                .as_ref()
+                .and_then(|(entry_key, started)| {
+                    (entry_key == &context_key).then(|| started.elapsed())
+                }),
+            self.editable_entry_last_attempt.map(|last| last.elapsed()),
+        );
+        if self.applied_context.as_ref() == Some(&context_key)
+            && !enforce_adobe_english
+            && !retry_editable_chinese
+        {
             return;
         }
 
-        // 每个上下文只自动切换一次。不能在 250ms 后补切，否则用户手动切成
-        // 英文时会被程序抢回中文，表现为必须按两次中英文快捷键。
-        self.applied_context = Some(context_key);
+        // 默认仍然每个上下文只切换一次。搜索框/TextInputHost 刚取得焦点时
+        // 可能尚未建立 IME 窗口，因此只在进入后的 260ms 内短时补发；窗口
+        // 结束后绝不持续抢回中文，保留用户手动切换一次即可生效的行为。
+        self.applied_context = Some(context_key.clone());
 
         if adobe_auto && !context.editable {
             self.adobe_english_attempts
                 .insert(context.process_id, Instant::now());
+        }
+        if target == LanguageTarget::Chinese && context.editable {
+            self.editable_entry_last_attempt = Some(Instant::now());
         }
 
         let _ = switch_language(context.focused_hwnd, context.foreground_hwnd, target);
@@ -190,6 +235,21 @@ fn should_enforce_adobe_english(
         && chinese_mode
         && since_last_attempt.map_or(true, |elapsed| {
             elapsed >= Duration::from_millis(ADOBE_ENGLISH_RETRY_MS)
+        })
+}
+
+fn should_retry_editable_chinese(
+    target: LanguageTarget,
+    chinese_mode: bool,
+    since_entry: Option<Duration>,
+    since_last_attempt: Option<Duration>,
+) -> bool {
+    target == LanguageTarget::Chinese
+        && !chinese_mode
+        && since_entry
+            .is_some_and(|elapsed| elapsed <= Duration::from_millis(EDITABLE_ENTRY_RETRY_WINDOW_MS))
+        && since_last_attempt.map_or(true, |elapsed| {
+            elapsed >= Duration::from_millis(EDITABLE_ENTRY_RETRY_INTERVAL_MS)
         })
 }
 
@@ -327,7 +387,8 @@ mod tests {
 
     use super::{
         default_rule_for_process, ime_open_status_for_target, is_indicator_only_process,
-        should_enforce_adobe_english, target_for, LanguageTarget, SwitchContextKey,
+        should_enforce_adobe_english, should_retry_editable_chinese, target_for, LanguageTarget,
+        SwitchContextKey,
     };
     use crate::caret_detector::FocusContext;
 
@@ -392,6 +453,34 @@ mod tests {
         ));
         assert!(!should_enforce_adobe_english(true, true, true, None));
         assert!(!should_enforce_adobe_english(true, false, false, None));
+    }
+
+    #[test]
+    fn editable_entry_retries_only_during_short_focus_window() {
+        assert!(should_retry_editable_chinese(
+            LanguageTarget::Chinese,
+            false,
+            Some(Duration::from_millis(90)),
+            Some(Duration::from_millis(80)),
+        ));
+        assert!(!should_retry_editable_chinese(
+            LanguageTarget::Chinese,
+            false,
+            Some(Duration::from_millis(300)),
+            Some(Duration::from_millis(80)),
+        ));
+        assert!(!should_retry_editable_chinese(
+            LanguageTarget::Chinese,
+            true,
+            Some(Duration::from_millis(90)),
+            Some(Duration::from_millis(80)),
+        ));
+        assert!(!should_retry_editable_chinese(
+            LanguageTarget::English,
+            false,
+            Some(Duration::from_millis(90)),
+            Some(Duration::from_millis(80)),
+        ));
     }
 
     #[test]

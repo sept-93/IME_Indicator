@@ -1,9 +1,9 @@
 //! 文本光标位置检测模块 - 多级检测策略
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -103,6 +103,15 @@ const OFFICE_SPREADSHEET_APPS: &[&str] = &["et.exe", "EXCEL.EXE"];
 // 按下沿，避免 Photoshop/Illustrator 已经退出文字编辑，但主循环漏掉按键。
 static ESCAPE_LATCHED: AtomicBool = AtomicBool::new(false);
 static ESCAPE_WATCHER_STARTED: AtomicBool = AtomicBool::new(false);
+static LEFT_CLICK_SAMPLES: Mutex<VecDeque<ClickSample>> = Mutex::new(VecDeque::new());
+
+#[derive(Clone, Copy)]
+struct ClickSample {
+    at: Instant,
+    process_id: u32,
+    x: i32,
+    y: i32,
+}
 
 pub fn start_escape_watcher(running: Arc<AtomicBool>) {
     if ESCAPE_WATCHER_STARTED
@@ -114,16 +123,57 @@ pub fn start_escape_watcher(running: Arc<AtomicBool>) {
 
     thread::spawn(move || {
         let mut was_down = false;
+        let mut left_was_down = false;
         while running.load(Ordering::SeqCst) {
             let down = unsafe { (GetAsyncKeyState(VK_ESCAPE.0 as i32) as u16 & 0x8000) != 0 };
             if down && !was_down {
                 ESCAPE_LATCHED.store(true, Ordering::SeqCst);
             }
             was_down = down;
+
+            // 主检测循环通常只每 100ms 读取一次状态，快速双击的两次按下可能
+            // 被合并成一次。5ms 采样独立记录每个按下沿，确保 Photoshop 画布
+            // 中双击已有文字时不会漏掉第二次点击。
+            let left_down = unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 };
+            if left_down && !left_was_down {
+                let mut point = POINT::default();
+                if unsafe { GetCursorPos(&mut point).is_ok() } {
+                    let foreground = unsafe { GetForegroundWindow() };
+                    let mut process_id = 0;
+                    unsafe {
+                        GetWindowThreadProcessId(foreground, Some(&mut process_id));
+                    }
+                    if let Ok(mut samples) = LEFT_CLICK_SAMPLES.lock() {
+                        if samples.len() >= 12 {
+                            samples.pop_front();
+                        }
+                        samples.push_back(ClickSample {
+                            at: Instant::now(),
+                            process_id,
+                            x: point.x,
+                            y: point.y,
+                        });
+                    }
+                }
+            }
+            left_was_down = left_down;
             thread::sleep(Duration::from_millis(5));
         }
         ESCAPE_WATCHER_STARTED.store(false, Ordering::SeqCst);
     });
+}
+
+fn take_click_samples(process_id: u32) -> Vec<ClickSample> {
+    let Ok(mut queued) = LEFT_CLICK_SAMPLES.lock() else {
+        return Vec::new();
+    };
+    let mut matching = Vec::new();
+    while let Some(sample) = queued.pop_front() {
+        if sample.at.elapsed() <= Duration::from_millis(650) && sample.process_id == process_id {
+            matching.push(sample);
+        }
+    }
+    matching
 }
 
 // ============================================================================
@@ -412,7 +462,7 @@ impl CaretDetector {
             || escape_since_last
             || (escape_now && !self.escape_down);
         let enter_pressed = enter_since_last || (enter_now && !self.enter_down);
-        let left_pressed = left_since_last || (left_now && !self.left_down);
+        let direct_left_pressed = left_since_last || (left_now && !self.left_down);
         let v_pressed = v_since_last || (v_now && !self.v_down);
         self.t_down = t_now;
         self.b_down = b_now;
@@ -425,25 +475,37 @@ impl CaretDetector {
             return false;
         }
 
-        let mut click_point = POINT::default();
-        let have_click_point = left_pressed && unsafe { GetCursorPos(&mut click_point).is_ok() };
-        let double_click = have_click_point
-            && self
+        let mut click_samples = take_click_samples(process_id);
+        if click_samples.is_empty() && direct_left_pressed {
+            let mut point = POINT::default();
+            if unsafe { GetCursorPos(&mut point).is_ok() } {
+                click_samples.push(ClickSample {
+                    at: Instant::now(),
+                    process_id,
+                    x: point.x,
+                    y: point.y,
+                });
+            }
+        }
+        let left_pressed = !click_samples.is_empty();
+        let mut double_click = false;
+        for sample in click_samples {
+            if self
                 .last_left_click
                 .as_ref()
                 .is_some_and(|(at, pid, x, y)| {
-                    *pid == process_id
-                        && at.elapsed() <= Duration::from_millis(500)
-                        && (click_point.x - *x).abs() <= 8
-                        && (click_point.y - *y).abs() <= 8
-                });
-        if left_pressed {
-            self.last_left_click = have_click_point.then_some((
-                Instant::now(),
-                process_id,
-                click_point.x,
-                click_point.y,
-            ));
+                    *pid == sample.process_id
+                        && sample
+                            .at
+                            .checked_duration_since(*at)
+                            .is_some_and(|elapsed| elapsed <= Duration::from_millis(500))
+                        && (sample.x - *x).abs() <= 8
+                        && (sample.y - *y).abs() <= 8
+                })
+            {
+                double_click = true;
+            }
+            self.last_left_click = Some((sample.at, sample.process_id, sample.x, sample.y));
         }
         let standard_arrow = left_pressed && crate::cursor_detector::is_standard_arrow_cursor();
 

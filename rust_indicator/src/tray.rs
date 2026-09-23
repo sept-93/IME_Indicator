@@ -1,11 +1,13 @@
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, BOOL, COLORREF, HWND, LPARAM, LRESULT, TRUE, WPARAM,
+    CloseHandle, BOOL, COLORREF, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, DeleteObject, GetSysColorBrush, SetBkMode, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
-    COLOR_WINDOW, DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, HBRUSH, HDC,
-    HFONT, OUT_DEFAULT_PRECIS, TRANSPARENT,
+    CreateFontW, DeleteObject, DrawFocusRect, DrawTextW, FillRect, GetSysColor, GetSysColorBrush,
+    SelectObject, SetBkMode, SetTextColor, BACKGROUND_MODE, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+    COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, DEFAULT_CHARSET,
+    DEFAULT_PITCH, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_NORMAL,
+    FW_SEMIBOLD, HBRUSH, HDC, HFONT, OUT_DEFAULT_PRECIS, TRANSPARENT,
 };
 use windows::Win32::Graphics::GdiPlus::{
     GdipCreateBitmapFromFile, GdipCreateHICONFromBitmap, GdipDisposeImage,
@@ -21,13 +23,12 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Controls::{
-    ImageList_Create, ImageList_Destroy, ImageList_ReplaceIcon, ImageList_SetBkColor,
-    InitCommonControlsEx, CLR_NONE, HIMAGELIST, ICC_LISTVIEW_CLASSES, ILC_COLOR32, ILC_MASK,
-    INITCOMMONCONTROLSEX, LVCF_WIDTH, LVCOLUMNW, LVIF_IMAGE, LVIF_TEXT, LVITEMW,
-    LVM_DELETEALLITEMS, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
+    ImageList_Create, ImageList_Destroy, InitCommonControlsEx, DRAWITEMSTRUCT, HIMAGELIST,
+    ICC_LISTVIEW_CLASSES, ILC_COLOR32, INITCOMMONCONTROLSEX, LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT,
+    LVITEMW, LVM_DELETEALLITEMS, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
     LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST, LVNI_SELECTED, LVSIL_SMALL,
-    LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOCOLUMNHEADER, LVS_REPORT, LVS_SHOWSELALWAYS,
-    LVS_SINGLESEL,
+    LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOCOLUMNHEADER, LVS_OWNERDRAWFIXED, LVS_REPORT,
+    LVS_SHOWSELALWAYS, LVS_SINGLESEL, ODS_FOCUS, ODS_SELECTED,
 };
 use windows::Win32::UI::Shell::{
     SHGetFileInfoW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
@@ -35,14 +36,15 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW,
-    EnumChildWindows, EnumWindows, GetCursorPos, GetMessageW, GetSystemMetrics,
+    DrawIconEx, EnumChildWindows, EnumWindows, GetCursorPos, GetMessageW, GetSystemMetrics,
     GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible, LoadIconW, PostMessageW,
     PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow, ShowWindow, TrackPopupMenu,
     TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON,
-    CW_USEDEFAULT, HICON, HMENU, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, TPM_BOTTOMALIGN,
-    TPM_LEFTALIGN, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC,
-    WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_SETFONT, WM_USER, WNDCLASSW, WS_CHILD,
-    WS_EX_CLIENTEDGE, WS_GROUP, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    CW_USEDEFAULT, DI_NORMAL, HICON, HMENU, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW,
+    TPM_BOTTOMALIGN, TPM_LEFTALIGN, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN,
+    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_SETFONT,
+    WM_USER, WNDCLASSW, WS_CHILD, WS_EX_CLIENTEDGE, WS_GROUP, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+    WS_VISIBLE,
 };
 
 use std::cell::RefCell;
@@ -94,6 +96,7 @@ struct AppRuleEditorState {
     font: HFONT,
     title_font: HFONT,
     image_list: Option<HIMAGELIST>,
+    app_icons: Vec<HICON>,
     apps: Vec<RunningApp>,
 }
 
@@ -581,7 +584,13 @@ fn show_app_rule_editor() {
             WS_CHILD
                 | WS_VISIBLE
                 | WS_TABSTOP
-                | WINDOW_STYLE(LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOCOLUMNHEADER),
+                | WINDOW_STYLE(
+                    LVS_REPORT
+                        | LVS_SINGLESEL
+                        | LVS_SHOWSELALWAYS
+                        | LVS_NOCOLUMNHEADER
+                        | LVS_OWNERDRAWFIXED,
+                ),
             16,
             58,
             352,
@@ -733,6 +742,7 @@ fn show_app_rule_editor() {
                 font,
                 title_font,
                 image_list: None,
+                app_icons: Vec::new(),
                 apps: Vec::new(),
             });
         });
@@ -781,6 +791,14 @@ unsafe extern "system" fn app_rule_window_proc(
             }
             LRESULT(0)
         }
+        WM_DRAWITEM => {
+            let draw = &*(lparam.0 as *const DRAWITEMSTRUCT);
+            if draw.CtlID == IDC_APP_LIST && draw_app_rule_item(draw) {
+                LRESULT(1)
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+        }
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
             let hdc = HDC(wparam.0 as *mut _);
             let _ = SetBkMode(hdc, TRANSPARENT);
@@ -795,6 +813,11 @@ unsafe extern "system" fn app_rule_window_proc(
                 let mut state = state.borrow_mut();
                 if state.as_ref().is_some_and(|editor| editor.hwnd == hwnd) {
                     if let Some(editor) = state.take() {
+                        for icon in editor.app_icons {
+                            if !icon.0.is_null() {
+                                let _ = DestroyIcon(icon);
+                            }
+                        }
                         if let Some(image_list) = editor.image_list {
                             let _ = ImageList_Destroy(image_list);
                         }
@@ -811,33 +834,39 @@ unsafe extern "system" fn app_rule_window_proc(
 
 fn refresh_running_apps() {
     let apps = enumerate_running_apps();
+    let app_icons = load_app_icons(&apps);
     APP_RULE_EDITOR.with(|state| {
         let mut state = state.borrow_mut();
         let Some(editor) = state.as_mut() else { return };
         unsafe {
             let _ = SendMessageW(editor.list, LVM_DELETEALLITEMS, WPARAM(0), LPARAM(0));
-            let (new_image_list, image_indices) = create_app_image_list(&apps);
-            let image_handle = new_image_list.map_or(0, |images| images.0);
-            let _ = SendMessageW(
-                editor.list,
-                LVM_SETIMAGELIST,
-                WPARAM(LVSIL_SMALL as usize),
-                LPARAM(image_handle),
-            );
-            let old_image_list = editor.image_list.take();
-            editor.image_list = new_image_list;
-            if let Some(old_image_list) = old_image_list {
-                let _ = ImageList_Destroy(old_image_list);
+            if editor.image_list.is_none() {
+                editor.image_list = create_row_height_image_list();
+                let image_handle = editor.image_list.map_or(0, |images| images.0);
+                let _ = SendMessageW(
+                    editor.list,
+                    LVM_SETIMAGELIST,
+                    WPARAM(LVSIL_SMALL as usize),
+                    LPARAM(image_handle),
+                );
             }
+            for icon in editor.app_icons.drain(..) {
+                if !icon.0.is_null() {
+                    let _ = DestroyIcon(icon);
+                }
+            }
+            editor.app_icons = app_icons;
+            editor.apps.clear();
 
-            for (index, app) in apps.iter().enumerate() {
+            for app in &apps {
                 let mut wide: Vec<u16> = app.display_name.encode_utf16().chain(Some(0)).collect();
+                let item_index = editor.apps.len() as i32;
+                editor.apps.push(app.clone());
                 let item = LVITEMW {
-                    mask: LVIF_TEXT | LVIF_IMAGE,
-                    iItem: index as i32,
+                    mask: LVIF_TEXT,
+                    iItem: item_index,
                     iSubItem: 0,
                     pszText: PWSTR(wide.as_mut_ptr()),
-                    iImage: image_indices.get(index).copied().unwrap_or(-1),
                     ..Default::default()
                 };
                 let _ = SendMessageW(
@@ -848,7 +877,6 @@ fn refresh_running_apps() {
                 );
             }
         }
-        editor.apps = apps;
     });
 }
 
@@ -970,39 +998,116 @@ fn process_info_from_id(process_id: u32) -> Option<(String, PathBuf)> {
     }
 }
 
-unsafe fn create_app_image_list(apps: &[RunningApp]) -> (Option<HIMAGELIST>, Vec<i32>) {
-    // 28px 图像列表决定紧凑的列表行高；Shell 小图标保留系统原生清晰度，
-    // 同时让 16px 图标在选中底色内留出上下间距，不再铺满整行。
-    let images = ImageList_Create(28, 28, ILC_COLOR32 | ILC_MASK, apps.len().max(1) as i32, 4);
-    if images.0 == 0 {
-        return (None, vec![-1; apps.len()]);
+fn create_row_height_image_list() -> Option<HIMAGELIST> {
+    // 报表模式的 ListView 用小图像列表高度决定行高。这里只提供一个 1x26
+    // 的空列表来得到接近任务管理器的行距；真正图标由 WM_DRAWITEM 以原生
+    // 16px HICON 居中绘制，图标与行高互不缩放。
+    unsafe {
+        let images = ImageList_Create(1, 26, ILC_COLOR32, 1, 1);
+        (images.0 != 0).then_some(images)
     }
-    let _ = ImageList_SetBkColor(images, COLORREF(CLR_NONE as u32));
+}
 
-    let mut image_indices = Vec::with_capacity(apps.len());
-    for app in apps {
-        let path: Vec<u16> = app
-            .exe_path
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
-        let mut file_info = SHFILEINFOW::default();
-        let loaded = SHGetFileInfoW(
-            PCWSTR(path.as_ptr()),
-            Default::default(),
-            Some(&mut file_info),
-            std::mem::size_of::<SHFILEINFOW>() as u32,
-            SHGFI_ICON | SHGFI_SMALLICON,
-        );
-        if loaded != 0 && !file_info.hIcon.0.is_null() {
-            image_indices.push(ImageList_ReplaceIcon(images, -1, file_info.hIcon));
-            let _ = DestroyIcon(file_info.hIcon);
-        } else {
-            image_indices.push(-1);
-        }
+fn load_app_icons(apps: &[RunningApp]) -> Vec<HICON> {
+    apps.iter()
+        .map(|app| unsafe {
+            let path: Vec<u16> = app
+                .exe_path
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            let mut file_info = SHFILEINFOW::default();
+            let loaded = SHGetFileInfoW(
+                PCWSTR(path.as_ptr()),
+                Default::default(),
+                Some(&mut file_info),
+                std::mem::size_of::<SHFILEINFOW>() as u32,
+                SHGFI_ICON | SHGFI_SMALLICON,
+            );
+            if loaded != 0 {
+                file_info.hIcon
+            } else {
+                HICON::default()
+            }
+        })
+        .collect()
+}
+
+unsafe fn draw_app_rule_item(draw: &DRAWITEMSTRUCT) -> bool {
+    if draw.itemID == u32::MAX {
+        return false;
     }
-    (Some(images), image_indices)
+    let item = APP_RULE_EDITOR.with(|state| {
+        let Ok(state) = state.try_borrow() else {
+            return None;
+        };
+        let editor = state.as_ref()?;
+        let index = draw.itemID as usize;
+        Some((
+            editor.apps.get(index)?.display_name.clone(),
+            editor.app_icons.get(index).copied().unwrap_or_default(),
+            editor.font,
+        ))
+    });
+    let Some((label, icon, font)) = item else {
+        return false;
+    };
+
+    let selected = draw.itemState.0 & ODS_SELECTED.0 != 0;
+    let background = if selected {
+        COLOR_HIGHLIGHT
+    } else {
+        COLOR_WINDOW
+    };
+    let foreground = if selected {
+        COLOR_HIGHLIGHTTEXT
+    } else {
+        COLOR_WINDOWTEXT
+    };
+    let _ = FillRect(draw.hDC, &draw.rcItem, GetSysColorBrush(background));
+
+    const ICON_SIZE: i32 = 16;
+    if !icon.0.is_null() {
+        let row_height = draw.rcItem.bottom - draw.rcItem.top;
+        let icon_y = draw.rcItem.top + ((row_height - ICON_SIZE) / 2).max(0);
+        let _ = DrawIconEx(
+            draw.hDC,
+            draw.rcItem.left + 5,
+            icon_y,
+            icon,
+            ICON_SIZE,
+            ICON_SIZE,
+            0,
+            HBRUSH::default(),
+            DI_NORMAL,
+        );
+    }
+
+    let mut text_rect = RECT {
+        left: draw.rcItem.left + 26,
+        top: draw.rcItem.top,
+        right: draw.rcItem.right - 5,
+        bottom: draw.rcItem.bottom,
+    };
+    let mut wide: Vec<u16> = label.encode_utf16().collect();
+    let old_font = SelectObject(draw.hDC, font);
+    let old_color = SetTextColor(draw.hDC, COLORREF(GetSysColor(foreground)));
+    let old_bk_mode = SetBkMode(draw.hDC, TRANSPARENT);
+    let _ = DrawTextW(
+        draw.hDC,
+        &mut wide,
+        &mut text_rect,
+        DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+    );
+    let _ = SetBkMode(draw.hDC, BACKGROUND_MODE(old_bk_mode as u32));
+    let _ = SetTextColor(draw.hDC, old_color);
+    let _ = SelectObject(draw.hDC, old_font);
+
+    if draw.itemState.0 & ODS_FOCUS.0 != 0 {
+        let _ = DrawFocusRect(draw.hDC, &draw.rcItem);
+    }
+    true
 }
 
 fn open_config() {
