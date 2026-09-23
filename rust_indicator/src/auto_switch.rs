@@ -1,7 +1,7 @@
 //! 焦点上下文感知输入法切换。
 //! 只在上下文稳定且发生变化时切换一次，保留用户在当前输入框内的手动选择。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,7 @@ const IMC_SETCONVERSIONMODE: usize = 0x0002;
 const IMC_SETOPENSTATUS: usize = 0x0006;
 const IME_CMODE_NATIVE: isize = 0x0001;
 const INPUTLANGCHANGE_SYSCHARSET: usize = 0x0001;
+const ADOBE_ENGLISH_RETRY_MS: u64 = 120;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LanguageTarget {
@@ -55,6 +56,7 @@ pub struct AutoSwitcher {
     applied_context: Option<SwitchContextKey>,
     enabled_last: bool,
     adobe_editable_processes: HashSet<u32>,
+    adobe_english_attempts: HashMap<u32, Instant>,
 }
 
 impl AutoSwitcher {
@@ -65,10 +67,11 @@ impl AutoSwitcher {
             applied_context: None,
             enabled_last: crate::tray::smart_switch_enabled(),
             adobe_editable_processes: HashSet::new(),
+            adobe_english_attempts: HashMap::new(),
         }
     }
 
-    pub fn observe(&mut self, context: FocusContext, _chinese_mode: bool) {
+    pub fn observe(&mut self, context: FocusContext, chinese_mode: bool) {
         let enabled = crate::tray::smart_switch_enabled();
         if !enabled {
             self.enabled_last = false;
@@ -126,7 +129,8 @@ impl AutoSwitcher {
         // Adobe 的 auto 模式在启动窗口阶段不接收跨进程语言消息。只有该进程
         // 确实进入过文字编辑后，才在退出编辑时发一次英文切换。显式设置的
         // 固定中文/英文规则仍然按用户选择执行。
-        if rule == "auto" && is_adobe_design_process(&process_name) {
+        let adobe_auto = rule == "auto" && is_adobe_design_process(&process_name);
+        if adobe_auto {
             if context.editable {
                 self.adobe_editable_processes.insert(context.process_id);
             } else if !self.adobe_editable_processes.contains(&context.process_id) {
@@ -138,13 +142,26 @@ impl AutoSwitcher {
             return;
         };
 
-        if self.applied_context.as_ref() == Some(&context_key) {
+        let enforce_adobe_english = should_enforce_adobe_english(
+            adobe_auto,
+            context.editable,
+            chinese_mode,
+            self.adobe_english_attempts
+                .get(&context.process_id)
+                .map(Instant::elapsed),
+        );
+        if self.applied_context.as_ref() == Some(&context_key) && !enforce_adobe_english {
             return;
         }
 
         // 每个上下文只自动切换一次。不能在 250ms 后补切，否则用户手动切成
         // 英文时会被程序抢回中文，表现为必须按两次中英文快捷键。
         self.applied_context = Some(context_key);
+
+        if adobe_auto && !context.editable {
+            self.adobe_english_attempts
+                .insert(context.process_id, Instant::now());
+        }
 
         let _ = switch_language(context.focused_hwnd, context.foreground_hwnd, target);
     }
@@ -160,6 +177,20 @@ fn is_adobe_design_process(process_name: &str) -> bool {
     ["Photoshop.exe", "Illustrator.exe"]
         .iter()
         .any(|candidate| process_name.eq_ignore_ascii_case(candidate))
+}
+
+fn should_enforce_adobe_english(
+    adobe_auto: bool,
+    editable: bool,
+    chinese_mode: bool,
+    since_last_attempt: Option<Duration>,
+) -> bool {
+    adobe_auto
+        && !editable
+        && chinese_mode
+        && since_last_attempt.map_or(true, |elapsed| {
+            elapsed >= Duration::from_millis(ADOBE_ENGLISH_RETRY_MS)
+        })
 }
 
 fn default_rule_for_process(process_name: &str) -> &'static str {
@@ -290,11 +321,13 @@ fn send_ime_control(hwnd: HWND, command: usize, value: isize) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use windows::Win32::Foundation::HWND;
 
     use super::{
         default_rule_for_process, ime_open_status_for_target, is_indicator_only_process,
-        target_for, LanguageTarget, SwitchContextKey,
+        should_enforce_adobe_english, target_for, LanguageTarget, SwitchContextKey,
     };
     use crate::caret_detector::FocusContext;
 
@@ -340,6 +373,25 @@ mod tests {
         assert_eq!(target_for("ignore", false, true), None);
         assert_eq!(ime_open_status_for_target(LanguageTarget::Chinese), 1);
         assert_eq!(ime_open_status_for_target(LanguageTarget::English), 0);
+    }
+
+    #[test]
+    fn adobe_non_editing_area_keeps_retrying_english_only_while_chinese() {
+        assert!(should_enforce_adobe_english(true, false, true, None));
+        assert!(!should_enforce_adobe_english(
+            true,
+            false,
+            true,
+            Some(Duration::from_millis(80))
+        ));
+        assert!(should_enforce_adobe_english(
+            true,
+            false,
+            true,
+            Some(Duration::from_millis(120))
+        ));
+        assert!(!should_enforce_adobe_english(true, true, true, None));
+        assert!(!should_enforce_adobe_english(true, false, false, None));
     }
 
     #[test]

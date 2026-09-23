@@ -3,10 +3,9 @@ use windows::Win32::Foundation::{
     CloseHandle, BOOL, COLORREF, HWND, LPARAM, LRESULT, TRUE, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, GetSysColorBrush,
-    SelectObject, SetBkMode, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY,
-    CLIP_DEFAULT_PRECIS, COLOR_WINDOW, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, FF_DONTCARE,
-    FW_NORMAL, FW_SEMIBOLD, HBITMAP, HBRUSH, HDC, HFONT, OUT_DEFAULT_PRECIS, TRANSPARENT,
+    CreateFontW, DeleteObject, GetSysColorBrush, SetBkMode, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+    COLOR_WINDOW, DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, HBRUSH, HDC,
+    HFONT, OUT_DEFAULT_PRECIS, TRANSPARENT,
 };
 use windows::Win32::Graphics::GdiPlus::{
     GdipCreateBitmapFromFile, GdipCreateHICONFromBitmap, GdipDisposeImage,
@@ -22,12 +21,13 @@ use windows::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Controls::{
-    ImageList_Add, ImageList_Create, ImageList_Destroy, ImageList_SetBkColor, InitCommonControlsEx,
-    CLR_NONE, HIMAGELIST, ICC_LISTVIEW_CLASSES, ILC_COLOR32, INITCOMMONCONTROLSEX, LVCF_WIDTH,
-    LVCOLUMNW, LVIF_IMAGE, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_GETNEXTITEM,
-    LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST,
-    LVNI_SELECTED, LVSIL_SMALL, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOCOLUMNHEADER,
-    LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL,
+    ImageList_Create, ImageList_Destroy, ImageList_ReplaceIcon, ImageList_SetBkColor,
+    InitCommonControlsEx, CLR_NONE, HIMAGELIST, ICC_LISTVIEW_CLASSES, ILC_COLOR32, ILC_MASK,
+    INITCOMMONCONTROLSEX, LVCF_WIDTH, LVCOLUMNW, LVIF_IMAGE, LVIF_TEXT, LVITEMW,
+    LVM_DELETEALLITEMS, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST, LVNI_SELECTED, LVSIL_SMALL,
+    LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOCOLUMNHEADER, LVS_REPORT, LVS_SHOWSELALWAYS,
+    LVS_SINGLESEL,
 };
 use windows::Win32::UI::Shell::{
     SHGetFileInfoW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
@@ -35,14 +35,14 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW,
-    DrawIconEx, EnumChildWindows, EnumWindows, GetCursorPos, GetMessageW, GetSystemMetrics,
+    EnumChildWindows, EnumWindows, GetCursorPos, GetMessageW, GetSystemMetrics,
     GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible, LoadIconW, PostMessageW,
     PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow, ShowWindow, TrackPopupMenu,
     TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON,
-    CW_USEDEFAULT, DI_NORMAL, HICON, HMENU, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW,
-    TPM_BOTTOMALIGN, TPM_LEFTALIGN, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN,
-    WM_CTLCOLORSTATIC, WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_SETFONT, WM_USER,
-    WNDCLASSW, WS_CHILD, WS_EX_CLIENTEDGE, WS_GROUP, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    CW_USEDEFAULT, HICON, HMENU, MSG, SM_CXSCREEN, SM_CYSCREEN, SW_SHOW, TPM_BOTTOMALIGN,
+    TPM_LEFTALIGN, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC,
+    WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_SETFONT, WM_USER, WNDCLASSW, WS_CHILD,
+    WS_EX_CLIENTEDGE, WS_GROUP, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 
 use std::cell::RefCell;
@@ -718,8 +718,8 @@ fn show_app_rule_editor() {
 
         // 未显式设置字体时，原生 LISTBOX/COMBOBOX 会退回难看的等宽系统字体。
         // 给全部子控件统一使用 Windows 默认界面字体，并立即重绘。
-        let font = create_ui_font(-12, FW_NORMAL.0 as i32);
-        let title_font = create_ui_font(-13, FW_SEMIBOLD.0 as i32);
+        let font = create_ui_font(-14, FW_NORMAL.0 as i32);
+        let title_font = create_ui_font(-14, FW_SEMIBOLD.0 as i32);
         let _ = EnumChildWindows(hwnd, Some(set_default_gui_font), LPARAM(font.0 as isize));
         if let Some(header) = header {
             let _ = SendMessageW(header, WM_SETFONT, WPARAM(title_font.0 as usize), LPARAM(1));
@@ -971,7 +971,9 @@ fn process_info_from_id(process_id: u32) -> Option<(String, PathBuf)> {
 }
 
 unsafe fn create_app_image_list(apps: &[RunningApp]) -> (Option<HIMAGELIST>, Vec<i32>) {
-    let images = ImageList_Create(28, 28, ILC_COLOR32, apps.len().max(1) as i32, 4);
+    // 使用 Shell 提供的原生 32px HICON，不再二次缩放/重采样；32px 高度同时
+    // 给列表行提供更舒适的上下间距。
+    let images = ImageList_Create(32, 32, ILC_COLOR32 | ILC_MASK, apps.len().max(1) as i32, 4);
     if images.0 == 0 {
         return (None, vec![-1; apps.len()]);
     }
@@ -994,98 +996,13 @@ unsafe fn create_app_image_list(apps: &[RunningApp]) -> (Option<HIMAGELIST>, Vec
             SHGFI_ICON | SHGFI_LARGEICON,
         );
         if loaded != 0 && !file_info.hIcon.0.is_null() {
-            let image_index =
-                if let Some(bitmap) = create_alpha_bitmap_from_icon(file_info.hIcon, 28) {
-                    let index = ImageList_Add(images, bitmap, HBITMAP::default());
-                    let _ = DeleteObject(bitmap);
-                    index
-                } else {
-                    -1
-                };
-            image_indices.push(image_index);
+            image_indices.push(ImageList_ReplaceIcon(images, -1, file_info.hIcon));
             let _ = DestroyIcon(file_info.hIcon);
         } else {
             image_indices.push(-1);
         }
     }
     (Some(images), image_indices)
-}
-
-/// 将 HICON 在黑、白两个不透明背景上各绘制一次，再由两份结果还原透明度。
-/// 这样既支持带 Alpha 的现代图标，也支持只带 AND mask 的旧式系统图标，
-/// 避免 ImageList_ReplaceIcon 把透明区域变成白色方块。
-unsafe fn create_alpha_bitmap_from_icon(icon: HICON, size: i32) -> Option<HBITMAP> {
-    let (black_bitmap, black_bits) = render_icon_layer(icon, size, 0xFF00_0000)?;
-    let Some((white_bitmap, white_bits)) = render_icon_layer(icon, size, 0xFFFF_FFFF) else {
-        let _ = DeleteObject(black_bitmap);
-        return None;
-    };
-
-    let pixel_count = (size * size) as usize;
-    let black = std::slice::from_raw_parts_mut(black_bits, pixel_count * 4);
-    let white = std::slice::from_raw_parts(white_bits, pixel_count * 4);
-    for index in 0..pixel_count {
-        let offset = index * 4;
-        black[offset + 3] = recovered_icon_alpha(
-            [black[offset], black[offset + 1], black[offset + 2]],
-            [white[offset], white[offset + 1], white[offset + 2]],
-        );
-    }
-
-    let _ = DeleteObject(white_bitmap);
-    Some(black_bitmap)
-}
-
-unsafe fn render_icon_layer(icon: HICON, size: i32, background: u32) -> Option<(HBITMAP, *mut u8)> {
-    let dc = CreateCompatibleDC(HDC::default());
-    if dc.0.is_null() {
-        return None;
-    }
-    let bitmap_info = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: size,
-            biHeight: -size,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let mut bits = std::ptr::null_mut();
-    let bitmap = match CreateDIBSection(dc, &bitmap_info, DIB_RGB_COLORS, &mut bits, None, 0) {
-        Ok(bitmap) => bitmap,
-        Err(_) => {
-            let _ = DeleteDC(dc);
-            return None;
-        }
-    };
-    if bits.is_null() {
-        let _ = DeleteObject(bitmap);
-        let _ = DeleteDC(dc);
-        return None;
-    }
-
-    let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, (size * size) as usize);
-    pixels.fill(background);
-    let old_bitmap = SelectObject(dc, bitmap);
-    let drawn = DrawIconEx(dc, 0, 0, icon, size, size, 0, HBRUSH::default(), DI_NORMAL).is_ok();
-    let _ = SelectObject(dc, old_bitmap);
-    let _ = DeleteDC(dc);
-    if !drawn {
-        let _ = DeleteObject(bitmap);
-        return None;
-    }
-    Some((bitmap, bits as *mut u8))
-}
-
-fn recovered_icon_alpha(black: [u8; 3], white: [u8; 3]) -> u8 {
-    let inverse_alpha = (0..3)
-        .map(|index| white[index].saturating_sub(black[index]) as u16)
-        .sum::<u16>()
-        / 3;
-    255 - inverse_alpha.min(255) as u8
 }
 
 fn open_config() {
@@ -1147,14 +1064,7 @@ fn restart_app() {
 
 #[cfg(test)]
 mod tests {
-    use super::{process_display_name, recovered_icon_alpha, APP_RULE_LABELS, APP_RULE_MODES};
-
-    #[test]
-    fn icon_alpha_is_recovered_from_black_and_white_renders() {
-        assert_eq!(recovered_icon_alpha([0, 0, 0], [255, 255, 255]), 0);
-        assert_eq!(recovered_icon_alpha([20, 40, 60], [20, 40, 60]), 255);
-        assert_eq!(recovered_icon_alpha([64, 64, 64], [191, 191, 191]), 128);
-    }
+    use super::{process_display_name, APP_RULE_LABELS, APP_RULE_MODES};
 
     #[test]
     fn destructive_and_indicator_only_rules_have_matching_positions() {
