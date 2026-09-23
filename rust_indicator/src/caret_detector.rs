@@ -100,6 +100,18 @@ const OFFICE_EDIT_APPS: &[&str] = &[
 
 const OFFICE_SPREADSHEET_APPS: &[&str] = &["et.exe", "EXCEL.EXE"];
 
+/// 粘贴文字或图片时，这些富文本应用可能短暂撤销系统 Caret，随后仍回到
+/// 原输入框。短暂缺失不能被解释成“离开输入区”。
+const TRANSIENT_CARET_APPS: &[&str] = &[
+    "Weixin.exe",
+    "WXWork.exe",
+    "WeCom.exe",
+    "Feishu.exe",
+    "Lark.exe",
+];
+const CARET_DROPOUT_GRACE_MS: u64 = 350;
+const PASTE_CARET_GRACE_MS: u64 = 1500;
+
 // UIA/IME 查询偶尔会让主检测循环停顿几十到数百毫秒。单独锁存 Esc 的
 // 按下沿，避免 Photoshop/Illustrator 已经退出文字编辑，但主循环漏掉按键。
 static ESCAPE_LATCHED: AtomicBool = AtomicBool::new(false);
@@ -263,6 +275,8 @@ pub struct CaretDetector {
     pending_design_native: Option<(u32, Instant)>,
     pending_design_tool_check: Option<(u32, Instant)>,
     pending_office_edit: Option<(u32, Instant)>,
+    transient_editable_seen: HashMap<u32, (usize, usize, Instant)>,
+    paste_started: HashMap<u32, Instant>,
     t_down: bool,
     b_down: bool,
     escape_down: bool,
@@ -299,6 +313,8 @@ impl CaretDetector {
             pending_design_native: None,
             pending_design_tool_check: None,
             pending_office_edit: None,
+            transient_editable_seen: HashMap::new(),
+            paste_started: HashMap::new(),
             t_down: false,
             b_down: false,
             escape_down: false,
@@ -370,6 +386,13 @@ impl CaretDetector {
                 } else {
                     has_caret || special_edit_mode
                 };
+                let editable = self.stabilize_transient_editable(
+                    &process_name,
+                    process_id,
+                    foreground_hwnd,
+                    focused_hwnd,
+                    editable,
+                );
                 return FocusContext {
                     identity: fallback_identity,
                     foreground_hwnd,
@@ -384,12 +407,19 @@ impl CaretDetector {
             }
 
             let Some(automation) = self.automation.as_ref() else {
+                let editable = self.stabilize_transient_editable(
+                    &process_name,
+                    process_id,
+                    foreground_hwnd,
+                    focused_hwnd,
+                    has_caret || special_edit_mode,
+                );
                 return FocusContext {
                     identity: fallback_identity,
                     foreground_hwnd,
                     focused_hwnd,
                     process_id,
-                    editable: has_caret || special_edit_mode,
+                    editable,
                     password: false,
                     readonly_document: false,
                     force_mouse_indicator: special_edit_mode && !has_caret,
@@ -397,12 +427,19 @@ impl CaretDetector {
                 };
             };
             let Ok(focused) = automation.GetFocusedElement() else {
+                let editable = self.stabilize_transient_editable(
+                    &process_name,
+                    process_id,
+                    foreground_hwnd,
+                    focused_hwnd,
+                    has_caret || special_edit_mode,
+                );
                 return FocusContext {
                     identity: fallback_identity,
                     foreground_hwnd,
                     focused_hwnd,
                     process_id,
-                    editable: has_caret || special_edit_mode,
+                    editable,
                     password: false,
                     readonly_document: false,
                     force_mouse_indicator: special_edit_mode && !has_caret,
@@ -439,7 +476,13 @@ impl CaretDetector {
                 // 使用 Caret 回退。其他应用保持严格模式，防止非输入区的黄色假点。
                 has_caret && caret_compat
             };
-            let editable = standard_editable || special_edit_mode;
+            let editable = self.stabilize_transient_editable(
+                &process_name,
+                process_id,
+                foreground_hwnd,
+                focused_hwnd,
+                standard_editable || special_edit_mode,
+            );
             let readonly_document = control_type == UIA_DocumentControlTypeId && !editable;
 
             let native_hwnd = focused.CurrentNativeWindowHandle().unwrap_or_default();
@@ -481,6 +524,40 @@ impl CaretDetector {
         }
     }
 
+    fn stabilize_transient_editable(
+        &mut self,
+        process_name: &str,
+        process_id: u32,
+        foreground_hwnd: HWND,
+        focused_hwnd: HWND,
+        editable: bool,
+    ) -> bool {
+        if !process_matches(process_name, TRANSIENT_CARET_APPS) {
+            return editable;
+        }
+
+        let foreground = foreground_hwnd.0 as usize;
+        let focused = focused_hwnd.0 as usize;
+        if editable {
+            self.transient_editable_seen
+                .insert(process_id, (foreground, focused, Instant::now()));
+            return true;
+        }
+
+        let last_seen = self.transient_editable_seen.get(&process_id);
+        let same_foreground =
+            last_seen.is_some_and(|(last_foreground, _, _)| *last_foreground == foreground);
+        let same_focus = last_seen.is_some_and(|(_, last_focused, _)| *last_focused == focused);
+        let last_seen_elapsed = last_seen.map(|(_, _, seen)| seen.elapsed());
+        let paste_elapsed = self.paste_started.get(&process_id).map(Instant::elapsed);
+        should_preserve_transient_editable(
+            same_foreground,
+            same_focus,
+            last_seen_elapsed,
+            paste_elapsed,
+        )
+    }
+
     fn update_application_edit_mode(
         &mut self,
         process_name: &str,
@@ -519,6 +596,12 @@ impl CaretDetector {
             return false;
         }
 
+        if ctrl_now && v_pressed && process_matches(process_name, TRANSIENT_CARET_APPS) {
+            self.paste_started.insert(process_id, Instant::now());
+        }
+        self.paste_started
+            .retain(|_, started| started.elapsed() <= Duration::from_millis(PASTE_CARET_GRACE_MS));
+
         let mut click_samples = take_click_samples(process_id);
         if click_samples.is_empty() && direct_left_pressed {
             let mut point = POINT::default();
@@ -535,6 +618,7 @@ impl CaretDetector {
         let double_click = consume_click_samples(&mut self.last_left_click, click_samples);
         self.input_double_click = double_click;
         let standard_arrow = left_pressed && crate::cursor_detector::is_standard_arrow_cursor();
+        let text_cursor = left_pressed && crate::cursor_detector::is_text_cursor();
         let native_edit_focus = has_caret
             && (window_class_is_edit_like(focused_hwnd) || window_class_is_edit_like(caret_hwnd));
 
@@ -658,7 +742,11 @@ impl CaretDetector {
             }
 
             if left_pressed {
-                if double_click && !standard_arrow {
+                if should_enter_design_canvas_text(
+                    double_click,
+                    self.design_text_tools.contains(&process_id),
+                    text_cursor,
+                ) {
                     self.design_text_tools.insert(process_id);
                     self.design_text_processes.insert(process_id);
                     self.design_native_processes.remove(&process_id);
@@ -674,7 +762,7 @@ impl CaretDetector {
                         self.design_native_processes.insert(process_id);
                         self.pending_design_native = None;
                     }
-                } else if self.design_text_tools.contains(&process_id) && !standard_arrow {
+                } else if self.design_text_tools.contains(&process_id) && text_cursor {
                     self.design_text_processes.insert(process_id);
                     self.design_native_processes.remove(&process_id);
                     self.design_caret_suppressed.remove(&process_id);
@@ -684,6 +772,14 @@ impl CaretDetector {
                 } else if standard_arrow {
                     // 普通区域点击必须优先于旧 Caret；否则图层重命名结束后
                     // Photoshop 残留的一帧 Caret 会把退出动作重新覆盖成中文。
+                    self.design_text_processes.remove(&process_id);
+                    self.design_text_tools.remove(&process_id);
+                    self.design_native_processes.remove(&process_id);
+                    self.design_text_cursor_handles.remove(&process_id);
+                    self.design_caret_suppressed.insert(process_id);
+                } else {
+                    // 移动、抓手、笔刷等工具均使用自定义非箭头光标。若没有
+                    // 明确文字光标，本次画布点击只能退出或保持非编辑状态。
                     self.design_text_processes.remove(&process_id);
                     self.design_text_tools.remove(&process_id);
                     self.design_native_processes.remove(&process_id);
@@ -928,6 +1024,33 @@ fn process_is_indicator_only(process_name: &str) -> bool {
         || crate::config::auto_switch_app_rule(process_name) == Some("ignore")
 }
 
+fn should_enter_design_canvas_text(
+    double_click: bool,
+    text_tool_armed: bool,
+    text_cursor: bool,
+) -> bool {
+    text_cursor && (double_click || text_tool_armed)
+}
+
+fn should_preserve_transient_editable(
+    same_foreground: bool,
+    same_focus: bool,
+    last_seen_elapsed: Option<Duration>,
+    paste_elapsed: Option<Duration>,
+) -> bool {
+    if !same_foreground {
+        return false;
+    }
+    let short_dropout = same_focus
+        && last_seen_elapsed
+            .is_some_and(|elapsed| elapsed <= Duration::from_millis(CARET_DROPOUT_GRACE_MS));
+    let paste_dropout = paste_elapsed
+        .is_some_and(|elapsed| elapsed <= Duration::from_millis(PASTE_CARET_GRACE_MS))
+        && last_seen_elapsed
+            .is_some_and(|elapsed| elapsed <= Duration::from_millis(PASTE_CARET_GRACE_MS + 500));
+    short_dropout || paste_dropout
+}
+
 fn process_matches(process_name: &str, candidates: &[&str]) -> bool {
     candidates
         .iter()
@@ -981,9 +1104,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        consume_click_samples, process_matches, ClickSample, CARET_COMPAT_APPS,
-        CARET_FAST_PATH_APPS, DESIGN_TEXT_SHORTCUT_APPS, GUI_ONLY_CARET_APPS, INDICATOR_ONLY_APPS,
-        OFFICE_EDIT_APPS, OFFICE_SPREADSHEET_APPS,
+        consume_click_samples, process_matches, should_enter_design_canvas_text,
+        should_preserve_transient_editable, ClickSample, CARET_COMPAT_APPS, CARET_FAST_PATH_APPS,
+        DESIGN_TEXT_SHORTCUT_APPS, GUI_ONLY_CARET_APPS, INDICATOR_ONLY_APPS, OFFICE_EDIT_APPS,
+        OFFICE_SPREADSHEET_APPS,
     };
 
     #[test]
@@ -1011,6 +1135,42 @@ mod tests {
             }]
         ));
         assert!(last_click.is_none());
+    }
+
+    #[test]
+    fn adobe_custom_canvas_cursors_do_not_imply_text_editing() {
+        assert!(!should_enter_design_canvas_text(true, false, false));
+        assert!(!should_enter_design_canvas_text(false, true, false));
+        assert!(should_enter_design_canvas_text(true, false, true));
+        assert!(should_enter_design_canvas_text(false, true, true));
+    }
+
+    #[test]
+    fn chat_caret_dropout_is_preserved_only_briefly_or_during_paste() {
+        assert!(should_preserve_transient_editable(
+            true,
+            true,
+            Some(Duration::from_millis(200)),
+            None,
+        ));
+        assert!(should_preserve_transient_editable(
+            true,
+            false,
+            Some(Duration::from_millis(700)),
+            Some(Duration::from_millis(500)),
+        ));
+        assert!(!should_preserve_transient_editable(
+            false,
+            true,
+            Some(Duration::from_millis(100)),
+            Some(Duration::from_millis(100)),
+        ));
+        assert!(!should_preserve_transient_editable(
+            true,
+            true,
+            Some(Duration::from_millis(1800)),
+            None,
+        ));
     }
 
     #[test]

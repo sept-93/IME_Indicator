@@ -627,7 +627,7 @@ fn show_app_rule_editor() {
             w!("处理方式"),
             WS_CHILD | WS_VISIBLE,
             16,
-            356,
+            348,
             120,
             18,
             hwnd,
@@ -638,11 +638,11 @@ fn show_app_rule_editor() {
 
         let mut rule_buttons = Vec::new();
         let positions = [
-            (16, 372, 140),
-            (160, 372, 104),
-            (264, 372, 104),
-            (16, 394, 140),
-            (160, 394, 140),
+            (16, 365, 140),
+            (160, 365, 104),
+            (264, 365, 104),
+            (16, 386, 140),
+            (160, 386, 140),
         ];
         for (index, label) in APP_RULE_LABELS.iter().enumerate() {
             let group = if index == 0 {
@@ -668,7 +668,7 @@ fn show_app_rule_editor() {
                 positions[index].0,
                 positions[index].1,
                 positions[index].2,
-                24,
+                22,
                 hwnd,
                 HMENU((IDC_RULE_FIRST + index as u32) as usize as *mut _),
                 h_instance,
@@ -688,7 +688,7 @@ fn show_app_rule_editor() {
             w!("刷新列表"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
             160,
-            426,
+            414,
             96,
             32,
             hwnd,
@@ -702,7 +702,7 @@ fn show_app_rule_editor() {
             w!("保存并应用"),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
             264,
-            426,
+            414,
             104,
             32,
             hwnd,
@@ -716,7 +716,7 @@ fn show_app_rule_editor() {
             w!("提示：仅显示状态不会自动切换或探测控件。"),
             WS_CHILD | WS_VISIBLE,
             16,
-            470,
+            462,
             352,
             18,
             hwnd,

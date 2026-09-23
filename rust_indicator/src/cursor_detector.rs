@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::HINSTANCE;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorInfo, LoadCursorW, CURSORINFO, CURSOR_SHOWING, HCURSOR, IDC_ARROW,
+    GetCursorInfo, LoadCursorW, CURSORINFO, CURSOR_SHOWING, HCURSOR, IDC_ARROW, IDC_IBEAM,
 };
 
 /// 鼠标形状检测器
@@ -16,6 +16,12 @@ pub struct CursorDetector {
 /// Adobe 等应用会使用自定义文字工具光标。用于区分画布文字点击与普通工具栏点击。
 pub fn is_standard_arrow_cursor() -> bool {
     is_shared_cursor(IDC_ARROW)
+}
+
+/// 仅认可系统文字光标。Adobe 的移动、抓手和笔刷也是自定义非箭头光标，
+/// 不能再用“不是箭头”作为进入文字编辑的依据。
+pub fn is_text_cursor() -> bool {
+    is_shared_cursor(IDC_IBEAM)
 }
 
 /// 返回当前可见鼠标光标的句柄，用于判断 Adobe 是否真的切换了工具。
